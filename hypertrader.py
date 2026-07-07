@@ -42,6 +42,11 @@ except Exception:  # TA-Lib is only required for the auto command.
     np = None  # type: ignore[assignment]
     talib = None  # type: ignore[assignment]
 
+try:
+    os.mkdir("logs")
+except FileExistsError:
+    pass
+
 decimal.getcontext().prec = 4
 
 
