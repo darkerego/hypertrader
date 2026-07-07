@@ -1,0 +1,2088 @@
+#!/usr/bin/env python3
+"""Async Hyperliquid trading helper.
+
+Modes:
+  trailing      Manage trailing stops for currently open perp positions.
+  market_maker  Event-driven maker ladder that rebalances on drift.
+  enter         Smart limit-entry bracket bot with stop-loss and take-profit logic.
+  watch         Watch for newly opened positions and automatically attach TP/SL logic.
+
+Environment:
+  HYPERLIQUID_SECRET_KEY      Private key for the trading wallet or API wallet.
+  HYPERLIQUID_ACCOUNT_ADDRESS Main wallet address / account address.
+
+This version is written for darkerego/hyperliquid-python-sdk-async.
+"""
+
+import argparse
+import asyncio
+import decimal
+import os
+import signal
+import statistics
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+import eth_account
+from eth_account.signers.local import LocalAccount
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+
+
+decimal.getcontext().prec = 4
+
+INTERVAL_TO_MS: Dict[str, int] = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+    "3d": 3 * 24 * 60 * 60_000,
+    "1w": 7 * 24 * 60_000 * 60,
+    "1M": 30 * 24 * 60_000 * 60,
+}
+
+PRICE_EPS = 1e-4
+VALID_LIMIT_TIFS = {"Alo", "Gtc", "Ioc"}
+
+
+# ---------------------------------------------------------------------------
+# Async SDK compatibility
+# ---------------------------------------------------------------------------
+
+async def _compat_name_to_asset(self: Info, name: str) -> int:
+    """Compatibility shim for async SDK revisions missing Info.name_to_asset."""
+    if hasattr(self, "_ensure_initialized"):
+        await self._ensure_initialized()  # type: ignore[attr-defined]
+
+    name_to_coin = getattr(self, "name_to_coin", {})
+    coin_to_asset = getattr(self, "coin_to_asset", {})
+    coin = name_to_coin.get(name, name)
+    if coin not in coin_to_asset:
+        raise KeyError(f"No Hyperliquid asset id found for {name!r}; known names include {list(name_to_coin)[:20]}")
+    return int(coin_to_asset[coin])
+
+
+def install_async_sdk_compat_shims() -> None:
+    """Install tiny runtime shims for async SDK branches that changed helper methods."""
+    if not hasattr(Info, "name_to_asset"):
+        setattr(Info, "name_to_asset", _compat_name_to_asset)
+
+
+install_async_sdk_compat_shims()
+
+
+# ---------------------------------------------------------------------------
+# Credentials / clients
+# ---------------------------------------------------------------------------
+
+def load_credentials() -> Tuple[str, str]:
+    """Load Hyperliquid credentials from environment variables."""
+    load_dotenv()
+
+    secret_key = os.getenv("HYPERLIQUID_SECRET_KEY")
+    account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
+
+    if not secret_key:
+        raise RuntimeError(
+            "HYPERLIQUID_SECRET_KEY is not set. Add it to your environment or .env file."
+        )
+    if not account_address:
+        raise RuntimeError(
+            "HYPERLIQUID_ACCOUNT_ADDRESS is not set. Add it to your environment or .env file."
+        )
+
+    return secret_key, account_address
+
+
+async def init_clients(use_testnet: bool) -> Tuple[str, Info, Exchange]:
+    """Initialize async Info and Exchange clients for Hyperliquid."""
+    secret_key, account_address = load_credentials()
+    api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
+    account: LocalAccount = eth_account.Account.from_key(secret_key)
+
+    info = await Info.create(api_url, skip_ws=True)
+    exchange = await Exchange.create(account, api_url, account_address=account_address)
+    return account_address, info, exchange
+
+
+async def close_clients(info: Optional[Info], exchange: Optional[Exchange]) -> None:
+    """Best-effort close for async SDK HTTP sessions."""
+    for client in (exchange, info):
+        if client is None:
+            continue
+        close = getattr(client, "aclose", None)
+        if close is None:
+            continue
+        try:
+            await close()
+        except Exception as exc:
+            print(f"[WARN] Failed to close async client cleanly: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Position helpers
+# ---------------------------------------------------------------------------
+
+async def get_all_open_positions(info: Info, account_address: str) -> List[Dict[str, Any]]:
+    """Return a list of open perp positions for the account."""
+    user_state = await info.user_state(account_address)
+    asset_positions = user_state.get("assetPositions", [])
+    open_positions: List[Dict[str, Any]] = []
+
+    for asset_pos in asset_positions:
+        position = asset_pos.get("position", {})
+        try:
+            size = float(position.get("szi", "0"))
+        except (TypeError, ValueError):
+            continue
+        if size != 0.0:
+            open_positions.append(position)
+
+    return open_positions
+
+
+async def get_position_size_for_coin(info: Info, account_address: str, coin: str) -> float:
+    """Return signed position size for a coin, or 0.0 if flat/not found."""
+    user_state = await info.user_state(account_address)
+    asset_positions = user_state.get("assetPositions", [])
+    for asset_pos in asset_positions:
+        position = asset_pos.get("position", {})
+        if str(position.get("coin", "")).lower() == coin.lower():
+            try:
+                return float(position.get("szi", "0"))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+async def get_position_for_coin(
+    info: Info,
+    account_address: str,
+    coin: str,
+) -> Optional[Dict[str, Any]]:
+    """Return full position dict for a coin if the account has a non-zero position."""
+    user_state = await info.user_state(account_address)
+    for asset_pos in user_state.get("assetPositions", []):
+        pos = asset_pos.get("position", {})
+        if str(pos.get("coin", "")).lower() != coin.lower():
+            continue
+        try:
+            if float(pos.get("szi", "0")) != 0.0:
+                return pos
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def get_all_mids(info: Info) -> Dict[str, float]:
+    """Fetch mid prices for all coins as dict[coin] = mid_price."""
+    mids_raw = await info.all_mids()
+    mids: Dict[str, float] = {}
+    for coin, px in mids_raw.items():
+        try:
+            mids[str(coin)] = float(px)
+        except (TypeError, ValueError):
+            continue
+    return mids
+
+
+# ---------------------------------------------------------------------------
+# Candle / volatility helpers
+# ---------------------------------------------------------------------------
+
+async def fetch_recent_candles(
+    info: Info,
+    coin: str,
+    interval: str,
+    periods: int,
+) -> List[Dict[str, Any]]:
+    """Fetch the last `periods` candles using the async SDK candleSnapshot helper."""
+    if interval not in INTERVAL_TO_MS:
+        raise RuntimeError(f"Unsupported interval {interval}. Valid: {sorted(INTERVAL_TO_MS.keys())}")
+    if periods <= 0:
+        raise RuntimeError("periods must be > 0")
+
+    now_ms = int(time.time() * 1000)
+    interval_ms = INTERVAL_TO_MS[interval]
+    window_ms = interval_ms * periods * 2
+    start_time = now_ms - window_ms
+    end_time = now_ms
+
+    data = await info.candles_snapshot(coin, interval, start_time, end_time)
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"No candle data returned for {coin} {interval}.")
+
+    return data[-periods:]
+
+
+def compute_center_and_sigma_from_candles(candles: List[Dict[str, Any]]) -> Tuple[float, float]:
+    """Compute center price and standard deviation from candle closes."""
+    closes: List[float] = []
+    highs: List[float] = []
+    lows: List[float] = []
+
+    for candle in candles:
+        try:
+            closes.append(float(candle["c"]))
+            highs.append(float(candle["h"]))
+            lows.append(float(candle["l"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if not closes:
+        raise RuntimeError("No valid close prices in candles.")
+
+    center = statistics.mean(closes)
+    try:
+        sigma = statistics.pstdev(closes)
+    except statistics.StatisticsError:
+        sigma = 0.0
+
+    if sigma <= 0.0:
+        ranges = [high - low for high, low in zip(highs, lows) if high >= low]
+        sigma = statistics.mean(ranges) if ranges else 0.0
+
+    if sigma <= 0.0:
+        raise RuntimeError("Standard deviation and average range are zero; market appears flat.")
+
+    return center, sigma
+
+
+# ---------------------------------------------------------------------------
+# Order / precision helpers
+# ---------------------------------------------------------------------------
+
+async def get_asset_id(info: Info, coin: str) -> int:
+    """Return Hyperliquid asset id for a coin/symbol name."""
+    try:
+        return int(await info.name_to_asset(coin))  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise RuntimeError(f"Could not resolve Hyperliquid asset id for {coin}: {exc}") from exc
+
+
+async def get_size_decimals(info: Info, coin: str) -> int:
+    """Return allowed size decimals for the given Hyperliquid asset."""
+    asset_id = await get_asset_id(info, coin)
+    try:
+        return int(info.asset_to_sz_decimals[asset_id])
+    except Exception as exc:
+        raise RuntimeError(f"Could not resolve size decimals for {coin}: {exc}") from exc
+
+
+async def round_size_for_hyperliquid(info: Info, coin: str, size: float) -> float:
+    """Round order size to the precision accepted by Hyperliquid."""
+    if size <= 0.0:
+        return 0.0
+    decimals_count = await get_size_decimals(info, coin)
+    rounded = round(float(size), decimals_count)
+    if rounded <= 0.0:
+        raise RuntimeError(
+            f"Rounded size for {coin} became zero. Input size={size}, szDecimals={decimals_count}."
+        )
+    return rounded
+
+
+async def round_price_for_hyperliquid(info: Info, coin: str, price: float) -> float:
+    """Round price to Hyperliquid's accepted precision."""
+    if price <= 0.0:
+        raise RuntimeError(f"Price must be positive for {coin}. Got: {price}")
+
+    asset_id = await get_asset_id(info, coin)
+    sz_decimals = await get_size_decimals(info, coin)
+    max_decimals = 8 if asset_id >= 10_000 else 6
+
+    if price > 100_000:
+        return float(round(price))
+
+    decimals_allowed = max(0, max_decimals - sz_decimals)
+    return round(float(f"{float(price):.5g}"), decimals_allowed)
+
+
+def extract_order_px(order: Dict[str, Any]) -> float:
+    """Extract order price across API variants."""
+    for key in ("px", "limitPx", "limit_px"):
+        value = order.get(key)
+        if value is not None:
+            return float(value)
+    raise KeyError(f"Order has no recognizable price key: {order}")
+
+
+def extract_order_error(resp: Any) -> Optional[str]:
+    """Extract error string from an exchange.order response, if any."""
+    try:
+        if not isinstance(resp, dict):
+            return None
+        response = resp.get("response") or {}
+        data = response.get("data") or {}
+        statuses = data.get("statuses") or []
+        if not statuses:
+            return None
+        status0 = statuses[0]
+        if isinstance(status0, dict) and "error" in status0:
+            return str(status0["error"])
+    except Exception:
+        return None
+    return None
+
+
+def extract_resting_oids(resp: Any) -> List[int]:
+    """Return resting order ids from an exchange.order/bulk_orders response."""
+    oids: List[int] = []
+    try:
+        statuses = resp.get("response", {}).get("data", {}).get("statuses", [])
+        for status in statuses:
+            resting = status.get("resting") if isinstance(status, dict) else None
+            if isinstance(resting, dict) and isinstance(resting.get("oid"), int):
+                oids.append(int(resting["oid"]))
+    except Exception:
+        return oids
+    return oids
+
+
+def extract_filled_qty(resp: Any) -> float:
+    """Return filled quantity from an exchange.order/bulk_orders response if present."""
+    total = 0.0
+    try:
+        statuses = resp.get("response", {}).get("data", {}).get("statuses", [])
+        for status in statuses:
+            filled = status.get("filled") if isinstance(status, dict) else None
+            if isinstance(filled, dict):
+                total += float(filled.get("totalSz", "0"))
+    except Exception:
+        return total
+    return total
+
+
+async def get_best_bid_ask(info: Info, coin: str) -> Tuple[Optional[float], Optional[float]]:
+    """Return (best_bid, best_ask) using the async SDK L2 snapshot helper."""
+    try:
+        snap = await info.l2_snapshot(coin)
+    except Exception as exc:
+        print(f"[WARN] Failed to fetch l2 snapshot for {coin}: {exc}")
+        return None, None
+
+    levels = snap.get("levels", [])
+    if not isinstance(levels, list) or not levels:
+        return None, None
+
+    bids = levels[0] if len(levels) > 0 else []
+    asks = levels[1] if len(levels) > 1 else []
+    best_bid = None
+    best_ask = None
+
+    if bids:
+        try:
+            best_bid = float(bids[0]["px"])
+        except (KeyError, TypeError, ValueError):
+            best_bid = None
+    if asks:
+        try:
+            best_ask = float(asks[0]["px"])
+        except (KeyError, TypeError, ValueError):
+            best_ask = None
+
+    return best_bid, best_ask
+
+
+async def get_open_orders_for_coin(info: Info, account_address: str, coin: str) -> List[Dict[str, Any]]:
+    """Return open orders for a specific coin."""
+    try:
+        open_orders = await info.open_orders(account_address)
+    except Exception as exc:
+        print(f"[WARN] Failed to fetch open orders: {exc}")
+        return []
+
+    coin_orders: List[Dict[str, Any]] = []
+    for order in open_orders:
+        try:
+            if str(order.get("coin", "")).lower() == coin.lower():
+                coin_orders.append(order)
+        except Exception:
+            continue
+    return coin_orders
+
+
+async def get_frontend_open_orders_for_coin(
+    info: Info,
+    account_address: str,
+    coin: str,
+) -> List[Dict[str, Any]]:
+    """Return frontend open orders for a coin, including reduceOnly/isTrigger fields."""
+    try:
+        orders = await info.frontend_open_orders(account_address)
+    except Exception as exc:
+        print(f"[WARN] Failed to fetch frontend open orders: {exc}")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for order in orders:
+        try:
+            if str(order.get("coin", "")).lower() == coin.lower():
+                out.append(order)
+        except Exception:
+            continue
+    return out
+
+
+async def cancel_oids(exchange: Exchange, coin: str, oids: List[int], label: str = "orders") -> None:
+    """Bulk-cancel a list of order ids for one coin."""
+    clean_oids = [int(oid) for oid in oids if isinstance(oid, int)]
+    if not clean_oids:
+        return
+
+    reqs = [{"coin": coin, "oid": oid} for oid in clean_oids]
+    try:
+        print(f"[CANCEL] Canceling {len(reqs)} {label} for {coin}: {clean_oids}")
+        resp = await exchange.bulk_cancel(reqs)
+        print(f"[CANCEL] {coin} {label} cancel response: {resp}")
+    except Exception as exc:
+        print(f"[WARN] Failed to cancel {label} for {coin}: {exc}")
+
+
+async def cancel_open_orders_for_coin(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    coin: str,
+    existing_orders: Optional[List[Dict[str, Any]]] = None,
+    mid: Optional[float] = None,
+    protect_close_pct: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """Cancel open orders for `coin`, optionally protecting orders near current mid."""
+    if existing_orders is None:
+        coin_orders = await get_open_orders_for_coin(info, account_address, coin)
+    else:
+        coin_orders = [order for order in existing_orders if str(order.get("coin", "")).lower() == coin.lower()]
+
+    protected: List[Dict[str, Any]] = []
+    cancel_requests: List[Dict[str, Any]] = []
+
+    for order in coin_orders:
+        try:
+            px = float(extract_order_px(order))
+        except (TypeError, ValueError, KeyError):
+            continue
+
+        if mid is not None and protect_close_pct > 0.0 and mid > 0.0:
+            dev = abs(px - mid) / mid
+            if dev <= protect_close_pct:
+                protected.append(order)
+                continue
+
+        try:
+            sz = float(order.get("sz", "0"))
+            oid = order.get("oid")
+        except (TypeError, ValueError):
+            continue
+
+        if sz > 0.0 and isinstance(oid, int):
+            cancel_requests.append({"coin": coin, "oid": oid})
+
+    if not cancel_requests:
+        if protected:
+            print(f"[MM] No orders to cancel for {coin}; {len(protected)} orders protected near mid.")
+        else:
+            print(f"[MM] No existing open orders to cancel for {coin}.")
+        return protected
+
+    print(
+        f"[MM] Canceling {len(cancel_requests)} existing open orders for {coin} in bulk; "
+        f"protecting {len(protected)} orders near mid."
+    )
+    try:
+        res = await exchange.bulk_cancel(cancel_requests)
+        print(f"[CANCEL] {coin} -> {res}")
+    except Exception as exc:
+        print(f"[ERROR] Bulk cancel for {coin} failed: {exc}")
+
+    return protected
+
+
+async def cancel_reduce_only_orders_for_coin(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    coin: str,
+    only_tpsl: bool = False,
+) -> None:
+    """Cancel reduce-only orders for a coin, optionally limiting to TP/SL trigger orders."""
+    orders = await get_frontend_open_orders_for_coin(info, account_address, coin)
+    oids: List[int] = []
+    for order in orders:
+        try:
+            if not bool(order.get("reduceOnly", False)):
+                continue
+            if only_tpsl and not bool(order.get("isTrigger", False)):
+                continue
+            oid = order.get("oid")
+            if isinstance(oid, int):
+                oids.append(oid)
+        except Exception:
+            continue
+    label = "reduce-only TP/SL orders" if only_tpsl else "reduce-only orders"
+    await cancel_oids(exchange, coin, oids, label)
+
+
+async def place_order_with_retry(
+    info: Info,
+    exchange: Exchange,
+    coin: str,
+    is_buy: bool,
+    size: float,
+    initial_px: float,
+    max_retries: int = 3,
+) -> None:
+    """Place a post-only order, retrying slightly adjusted prices if ALO fails."""
+    side = "BUY" if is_buy else "SELL"
+    px = initial_px
+
+    for attempt in range(max_retries):
+        try:
+            rounded_size = await round_size_for_hyperliquid(info, coin, size)
+            rounded_px = await round_price_for_hyperliquid(info, coin, px)
+            resp = await exchange.order(
+                coin,
+                is_buy,
+                rounded_size,
+                rounded_px,
+                {"limit": {"tif": "Alo"}},
+            )
+        except Exception as exc:
+            print(f"[ERROR] {side} {size:.8f} {coin} @ {px:.8f} exception: {exc}")
+            return
+
+        err = extract_order_error(resp)
+        if err is None:
+            print(f"[OK] {side:4} {size:.8f} {coin} @ {px:.8f} -> {resp}")
+            return
+
+        print(f"[WARN] {side} {size:.8f} {coin} @ {px:.8f} rejected: {err}")
+
+        if "Post only order would have immediately matched" in err:
+            best_bid, best_ask = await get_best_bid_ask(info, coin)
+            eps = PRICE_EPS * (attempt + 1)
+            if is_buy and best_bid is not None:
+                px = best_bid - eps
+                print(f"[RETRY] Adjusting BUY below best bid: new px={px:.8f}")
+                continue
+            if (not is_buy) and best_ask is not None:
+                px = best_ask + eps
+                print(f"[RETRY] Adjusting SELL above best ask: new px={px:.8f}")
+                continue
+
+            print("[RETRY] No valid BBO to adjust against; giving up.")
+            return
+
+        print("[WARN] Non post-only error, not retrying.")
+        return
+
+    print(f"[WARN] Max retries reached for {side} {size:.8f} {coin} (last px={px:.8f}).")
+
+
+# ---------------------------------------------------------------------------
+# Trailing stop manager
+# ---------------------------------------------------------------------------
+
+async def trailing_stop_for_all_positions(
+    trail_pct: float,
+    poll_interval: float,
+    use_testnet: bool,
+    only_coin: Optional[str] = None,
+) -> None:
+    """Trailing stop manager for all open positions or one coin."""
+    if not (0.0 < trail_pct < 1.0):
+        raise ValueError(f"trail_pct must be between 0 and 1. Got: {trail_pct}")
+    if poll_interval <= 0:
+        raise ValueError(f"poll_interval must be greater than 0. Got: {poll_interval}")
+
+    info: Optional[Info] = None
+    exchange: Optional[Exchange] = None
+    try:
+        account_address, info, exchange = await init_clients(use_testnet)
+        open_positions = await get_all_open_positions(info, account_address)
+        if only_coin is not None:
+            only_coin_upper = only_coin.upper()
+            open_positions = [
+                pos for pos in open_positions if str(pos.get("coin", "")).upper() == only_coin_upper
+            ]
+
+        if not open_positions:
+            if only_coin:
+                print(f"[!] No open positions found for {only_coin} on this account.")
+            else:
+                print("[!] No open perp positions found on this account.")
+            return
+
+        try:
+            mids = await get_all_mids(info)
+        except Exception as exc:
+            print(f"[ERROR] Failed to fetch mids before starting trailing stop manager: {exc}")
+            return
+
+        state: Dict[str, Dict[str, Any]] = {}
+
+        for pos in open_positions:
+            print(pos)
+            coin = pos.get("coin")
+            if not coin:
+                print(f"[WARN] Position missing coin field, skipping: {pos}")
+                continue
+            coin = str(coin)
+
+            if coin not in mids:
+                print(f"[WARN] No mid price for {coin}, skipping.")
+                continue
+
+            try:
+                size = float(pos["szi"])
+                entry_px = float(pos["entryPx"])
+                current_price = float(mids[coin])
+            except KeyError as exc:
+                print(f"[WARN] Position for {coin} missing field {exc}, skipping: {pos}")
+                continue
+            except (TypeError, ValueError) as exc:
+                print(f"[WARN] Could not parse position/mid values for {coin}: {exc}. Position: {pos}")
+                continue
+
+            if size == 0.0:
+                continue
+
+            side = "long" if size > 0.0 else "short"
+            entry_px_str = pos.get("entryPx", "N/A")
+
+            if side == "long":
+                if current_price <= entry_px:
+                    print(
+                        f"[!] Long {coin} is not in profit: current={current_price:.8f}, "
+                        f"entry={entry_px:.8f}, delta={current_price - entry_px:.8f}"
+                    )
+                    continue
+                highest_price = current_price
+                lowest_price = current_price
+                stop_price = max(entry_px, highest_price * (1.0 - trail_pct))
+            else:
+                if current_price >= entry_px:
+                    print(
+                        f"[!] Short {coin} is not in profit: current={current_price:.8f}, "
+                        f"entry={entry_px:.8f}, delta={entry_px - current_price:.8f}"
+                    )
+                    continue
+                highest_price = current_price
+                lowest_price = current_price
+                stop_price = min(entry_px, lowest_price * (1.0 + trail_pct))
+
+            state[coin] = {
+                "coin": coin,
+                "size": size,
+                "side": side,
+                "entry": entry_px,
+                "entryPx": entry_px_str,
+                "highest": highest_price,
+                "lowest": lowest_price,
+                "stop": stop_price,
+                "active": True,
+            }
+
+        if not state:
+            print("[!] No valid positions to manage trailing stops for.")
+            return
+
+        print("============================================================")
+        print(" Hyperliquid Async Trailing Stop Manager")
+        print("============================================================")
+        print(f"Account:       {account_address}")
+        print(f"Network:       {'TESTNET' if use_testnet else 'MAINNET'}")
+        print(f"Trail percent: {trail_pct * 100:.4f}%")
+        print(f"Poll interval: {poll_interval:.2f} s")
+        print("------------------------------------------------------------")
+
+        for coin, st in state.items():
+            print(
+                f"Coin: {coin:>8} | Side: {st['side']:>5} | Size: {st['size']:.8f} | "
+                f"Entry: {st['entryPx']} | Initial mid: {float(mids.get(coin, 0.0)):.8f} | "
+                f"Initial stop: {st['stop']:.8f}"
+            )
+
+        print("------------------------------------------------------------")
+        print("Press Ctrl+C to exit without closing remaining positions.")
+        print("============================================================")
+
+        while True:
+            if not any(st["active"] for st in state.values()):
+                print("[DONE] All managed positions have been closed.")
+                break
+
+            await asyncio.sleep(poll_interval)
+
+            try:
+                mids = await get_all_mids(info)
+            except Exception as exc:
+                print(f"[WARN] Failed to fetch mids: {exc}. Retrying...")
+                continue
+
+            for coin, st in list(state.items()):
+                if not st["active"]:
+                    continue
+                if coin not in mids:
+                    print(f"[WARN] Mid price for {coin} missing in this poll, skipping.")
+                    continue
+
+                try:
+                    price = float(mids[coin])
+                except (TypeError, ValueError) as exc:
+                    print(f"[WARN] Could not parse mid price for {coin}: {mids[coin]!r}. Error: {exc}")
+                    continue
+
+                side = st["side"]
+                if side == "long":
+                    if price > st["highest"]:
+                        st["highest"] = price
+                        st["stop"] = max(st["entry"], st["highest"] * (1.0 - trail_pct))
+                        print(f"[LONG] {coin} new high {st['highest']:.8f}, moved stop to {st['stop']:.8f}")
+
+                    if price <= st["stop"]:
+                        print(f"[LONG] {coin} stop hit! Price {price:.8f} <= stop {st['stop']:.8f}. Closing...")
+                        try:
+                            result = await exchange.market_close(coin)
+                            print(f"[RESULT] {coin} market_close response: {result}")
+                            st["active"] = False
+                        except Exception as exc:
+                            print(f"[ERROR] Failed to close {coin} position: {exc}")
+                            st["active"] = True
+                else:
+                    if price < st["lowest"]:
+                        st["lowest"] = price
+                        st["stop"] = min(st["entry"], st["lowest"] * (1.0 + trail_pct))
+                        print(f"[SHORT] {coin} new low {st['lowest']:.8f}, moved stop to {st['stop']:.8f}")
+
+                    if price >= st["stop"]:
+                        print(f"[SHORT] {coin} stop hit! Price {price:.8f} >= stop {st['stop']:.8f}. Closing...")
+                        try:
+                            result = await exchange.market_close(coin)
+                            print(f"[RESULT] {coin} market_close response: {result}")
+                            st["active"] = False
+                        except Exception as exc:
+                            print(f"[ERROR] Failed to close {coin} position: {exc}")
+                            st["active"] = True
+
+                print(
+                    f"[INFO] {coin} | Side: {side} | Last: {price:.8f} | "
+                    f"Stop: {st['stop']:.8f} | Active: {st['active']}"
+                )
+    except KeyboardInterrupt:
+        print("\n[!] Caught Ctrl+C, exiting without closing remaining positions.")
+    finally:
+        await close_clients(info, exchange)
+
+
+# ---------------------------------------------------------------------------
+# Bracket entry / TP / SL
+# ---------------------------------------------------------------------------
+
+def signed_position_delta(initial_pos: float, current_pos: float, is_buy: bool) -> float:
+    """Return how much of the desired directional entry has been filled."""
+    direction = 1.0 if is_buy else -1.0
+    return max(0.0, (current_pos - initial_pos) * direction)
+
+
+async def get_entry_limit_price(info: Info, coin: str, is_buy: bool) -> float:
+    """Return a top-of-book maker limit price for entry."""
+    best_bid, best_ask = await get_best_bid_ask(info, coin)
+    if is_buy and best_bid is not None:
+        return await round_price_for_hyperliquid(info, coin, best_bid)
+    if (not is_buy) and best_ask is not None:
+        return await round_price_for_hyperliquid(info, coin, best_ask)
+
+    mids = await get_all_mids(info)
+    if coin not in mids:
+        raise RuntimeError(f"No BBO or mid available for {coin}; cannot price entry order.")
+    return await round_price_for_hyperliquid(info, coin, float(mids[coin]))
+
+
+async def enter_position_with_reposting_limit(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    coin: str,
+    is_buy: bool,
+    size: float,
+    retries: int,
+    repost_interval: float,
+    entry_tif: str,
+    market_fallback: bool,
+    market_slippage: float,
+) -> Dict[str, Any]:
+    """Enter a position with async top-of-book limit reposts, then optional market fallback."""
+    if size <= 0.0:
+        raise RuntimeError("Entry size must be > 0.")
+    if retries < 0:
+        raise RuntimeError("Entry retries must be >= 0.")
+    if repost_interval <= 0.0:
+        raise RuntimeError("Entry repost interval must be > 0.")
+    if entry_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("entry_tif must be Alo or Gtc.")
+
+    size = await round_size_for_hyperliquid(info, coin, size)
+    initial_pos = await get_position_size_for_coin(info, account_address, coin)
+    direction_label = "LONG" if is_buy else "SHORT"
+
+    if initial_pos != 0.0:
+        print(
+            f"[WARN] Existing {coin} position is {initial_pos:.8f}. "
+            "Entry fill will be measured as directional delta from that starting position."
+        )
+
+    print("============================================================")
+    print(" Hyperliquid Async Smart Entry")
+    print("============================================================")
+    print(f"Coin:            {coin}")
+    print(f"Direction:       {direction_label}")
+    print(f"Requested size:  {size:.8f}")
+    print(f"Entry TIF:       {entry_tif}")
+    print(f"Limit retries:   {retries}")
+    print(f"Repost interval: {repost_interval:.2f}s")
+    print(f"Market fallback: {market_fallback}")
+    print("============================================================")
+
+    resting_oids: List[int] = []
+
+    for attempt in range(1, retries + 1):
+        current_pos = await get_position_size_for_coin(info, account_address, coin)
+        filled = signed_position_delta(initial_pos, current_pos, is_buy)
+        remaining = max(0.0, size - filled)
+        if remaining <= 0.0:
+            print(f"[ENTRY] Target position filled before attempt {attempt}.")
+            break
+
+        remaining = await round_size_for_hyperliquid(info, coin, remaining)
+        limit_px = await get_entry_limit_price(info, coin, is_buy)
+        side = "BUY" if is_buy else "SELL"
+        print(
+            f"[ENTRY {attempt}/{retries}] {side} {remaining:.8f} {coin} @ {limit_px:.8f} "
+            f"({entry_tif}, top-of-book)"
+        )
+
+        try:
+            resp = await exchange.order(
+                coin,
+                is_buy,
+                remaining,
+                limit_px,
+                {"limit": {"tif": entry_tif}},
+                reduce_only=False,
+            )
+            print(f"[ENTRY {attempt}] response: {resp}")
+        except Exception as exc:
+            print(f"[WARN] Entry order attempt {attempt} failed: {exc}")
+            await asyncio.sleep(repost_interval)
+            continue
+
+        resting_oids.extend(extract_resting_oids(resp))
+        await asyncio.sleep(repost_interval)
+
+        if resting_oids:
+            await cancel_oids(exchange, coin, resting_oids, "entry repost orders")
+            resting_oids.clear()
+
+        current_pos = await get_position_size_for_coin(info, account_address, coin)
+        filled = signed_position_delta(initial_pos, current_pos, is_buy)
+        remaining = max(0.0, size - filled)
+        print(
+            f"[ENTRY {attempt}] filled_delta={filled:.8f}, remaining={remaining:.8f}, "
+            f"position_now={current_pos:.8f}"
+        )
+        if remaining <= 0.0:
+            break
+
+    current_pos = await get_position_size_for_coin(info, account_address, coin)
+    filled = signed_position_delta(initial_pos, current_pos, is_buy)
+    remaining = max(0.0, size - filled)
+
+    if remaining > 0.0:
+        if market_fallback:
+            remaining = await round_size_for_hyperliquid(info, coin, remaining)
+            print(
+                f"[ENTRY] Limit retries exhausted with {remaining:.8f} {coin} remaining. "
+                f"Falling back to market_open with slippage={market_slippage:.4f}."
+            )
+            try:
+                resp = await exchange.market_open(coin, is_buy, remaining, slippage=market_slippage)
+                print(f"[MARKET ENTRY] response: {resp}")
+            except Exception as exc:
+                raise RuntimeError(f"Market fallback failed: {exc}") from exc
+        else:
+            raise RuntimeError(
+                f"Limit entry did not fully fill. Filled {filled:.8f} of {size:.8f}; market fallback disabled."
+            )
+
+    await asyncio.sleep(max(0.25, repost_interval))
+    final_pos = await get_position_for_coin(info, account_address, coin)
+    if final_pos is None:
+        raise RuntimeError(f"No open {coin} position found after entry attempts.")
+
+    final_size = float(final_pos.get("szi", "0"))
+    if is_buy and final_size <= initial_pos:
+        raise RuntimeError(f"Expected larger/longer {coin} position after buy entry, got {final_size}.")
+    if (not is_buy) and final_size >= initial_pos:
+        raise RuntimeError(f"Expected smaller/shorter {coin} position after sell entry, got {final_size}.")
+
+    return final_pos
+
+
+def compute_default_stop_loss_pct(
+    take_profit_pct: Optional[float],
+    stop_loss_pct: Optional[float],
+) -> Optional[float]:
+    """Apply default SL rule: TP without SL => SL = TP * 0.5."""
+    if stop_loss_pct is not None:
+        return stop_loss_pct
+    if take_profit_pct is not None:
+        return take_profit_pct * 0.5
+    return None
+
+
+async def stop_limit_px_for_trigger(
+    info: Info,
+    coin: str,
+    is_exit_buy: bool,
+    trigger_px: float,
+    slippage: float,
+) -> float:
+    """Compute aggressive limit px for a market-style TP/SL trigger order."""
+    if slippage < 0.0:
+        raise RuntimeError("slippage must be >= 0")
+    raw_px = trigger_px * (1.0 + slippage) if is_exit_buy else trigger_px * (1.0 - slippage)
+    return await round_price_for_hyperliquid(info, coin, raw_px)
+
+
+async def place_stop_market_order(
+    info: Info,
+    exchange: Exchange,
+    coin: str,
+    side: str,
+    position_size_abs: float,
+    entry_px: float,
+    stop_loss_pct: float,
+    slippage: float,
+) -> Tuple[Optional[int], float]:
+    """Place a reduce-only stop-market order for the full managed position."""
+    if not (0.0 < stop_loss_pct < 1.0):
+        raise RuntimeError("stop_loss_pct must be a decimal fraction between 0 and 1.")
+
+    size = await round_size_for_hyperliquid(info, coin, position_size_abs)
+    is_exit_buy = side == "short"
+    if side == "long":
+        trigger_px = entry_px * (1.0 - stop_loss_pct)
+    elif side == "short":
+        trigger_px = entry_px * (1.0 + stop_loss_pct)
+    else:
+        raise RuntimeError(f"Invalid side: {side}")
+
+    trigger_px = await round_price_for_hyperliquid(info, coin, trigger_px)
+    limit_px = await stop_limit_px_for_trigger(info, coin, is_exit_buy, trigger_px, slippage)
+    order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}}
+    side_label = "BUY" if is_exit_buy else "SELL"
+
+    print(
+        f"[SL] Placing reduce-only stop-market {side_label} {size:.8f} {coin}: "
+        f"trigger={trigger_px:.8f}, limit_px={limit_px:.8f}, sl_pct={stop_loss_pct * 100:.4f}%"
+    )
+    resp = await exchange.order(coin, is_exit_buy, size, limit_px, order_type, reduce_only=True)
+    print(f"[SL] response: {resp}")
+    oids = extract_resting_oids(resp)
+    return (oids[0] if oids else None), trigger_px
+
+
+async def build_take_profit_ladder(
+    info: Info,
+    coin: str,
+    side: str,
+    position_size_abs: float,
+    entry_px: float,
+    take_profit_pct: float,
+    levels: int,
+) -> List[Dict[str, Any]]:
+    """Build weighted TP limit orders that sum to the full position."""
+    if not (0.0 < take_profit_pct < 1.0):
+        raise RuntimeError("take_profit_pct must be a decimal fraction between 0 and 1.")
+    if levels <= 0:
+        raise RuntimeError("take-profit levels must be > 0")
+
+    exit_is_buy = side == "short"
+    weights = list(range(1, levels + 1))
+    weight_sum = float(sum(weights))
+    raw_sizes = [position_size_abs * (weight / weight_sum) for weight in weights]
+
+    orders: List[Dict[str, Any]] = []
+    remaining = await round_size_for_hyperliquid(info, coin, position_size_abs)
+
+    for idx, raw_sz in enumerate(raw_sizes, start=1):
+        if idx == levels:
+            sz = remaining
+        else:
+            sz = min(remaining, await round_size_for_hyperliquid(info, coin, raw_sz))
+        remaining = max(0.0, remaining - sz)
+        if sz <= 0.0:
+            continue
+
+        fraction = idx / levels
+        raw_px = entry_px * (1.0 + take_profit_pct * fraction) if side == "long" else entry_px * (1.0 - take_profit_pct * fraction)
+        px = await round_price_for_hyperliquid(info, coin, raw_px)
+        orders.append({"coin": coin, "is_buy": exit_is_buy, "sz": sz, "px": px, "level": idx})
+
+    return orders
+
+
+async def place_take_profit_ladder(
+    exchange: Exchange,
+    coin: str,
+    tp_orders: List[Dict[str, Any]],
+    tp_tif: str,
+) -> List[int]:
+    """Place reduce-only TP limit orders and return any resting oids."""
+    if tp_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("tp_tif must be Alo or Gtc.")
+    if not tp_orders:
+        return []
+
+    requests_payload: List[Dict[str, Any]] = []
+    print("[TP] Planned take-profit ladder:")
+    for order in tp_orders:
+        side = "BUY" if order["is_buy"] else "SELL"
+        print(f"  L{order['level']:02d} {side:4} {order['sz']:.8f} {coin} @ {order['px']:.8f}")
+        requests_payload.append(
+            {
+                "coin": coin,
+                "is_buy": bool(order["is_buy"]),
+                "sz": float(order["sz"]),
+                "limit_px": float(order["px"]),
+                "order_type": {"limit": {"tif": tp_tif}},
+                "reduce_only": True,
+            }
+        )
+
+    resp = await exchange.bulk_orders(requests_payload)
+    print(f"[TP] bulk_orders response: {resp}")
+    return extract_resting_oids(resp)
+
+
+async def monitor_bracket_position(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    coin: str,
+    side: str,
+    entry_px: float,
+    take_profit_pct: Optional[float],
+    tp_orders: List[Dict[str, Any]],
+    tp_oids: List[int],
+    stop_oid: Optional[int],
+    poll_interval: float,
+    reversal_pct: Optional[float],
+    market_slippage: float,
+) -> None:
+    """Monitor TP ladder and market-exit remaining position if price reverses after TP zone."""
+    if poll_interval <= 0.0:
+        raise RuntimeError("poll_interval must be > 0")
+    if take_profit_pct is not None and reversal_pct is None:
+        reversal_pct = max(0.0005, take_profit_pct * 0.25)
+    if reversal_pct is None:
+        reversal_pct = 0.0025
+    if not (0.0 < reversal_pct < 1.0):
+        raise RuntimeError("reversal_pct must be a decimal fraction between 0 and 1.")
+
+    side_is_long = side == "long"
+    tp_trigger_px: Optional[float] = None
+    if tp_orders:
+        prices = [float(order["px"]) for order in tp_orders]
+        tp_trigger_px = min(prices) if side_is_long else max(prices)
+
+    print("============================================================")
+    print(" Async Bracket Position Monitor")
+    print("============================================================")
+    print(f"Coin:             {coin}")
+    print(f"Side:             {side}")
+    print(f"Entry:            {entry_px:.8f}")
+    print(f"First TP px:       {tp_trigger_px if tp_trigger_px is not None else 'N/A'}")
+    print(f"TP reversal pct:   {reversal_pct * 100:.4f}%")
+    print(f"Stop oid:          {stop_oid if stop_oid is not None else 'N/A'}")
+    print(f"TP resting oids:   {tp_oids}")
+    print(f"Poll interval:     {poll_interval:.2f}s")
+    print("------------------------------------------------------------")
+    print("Press Ctrl+C to stop monitoring without closing the position.")
+    print("============================================================")
+
+    favorable_extreme: Optional[float] = None
+    tp_zone_seen = False
+
+    try:
+        while True:
+            await asyncio.sleep(poll_interval)
+
+            pos = await get_position_for_coin(info, account_address, coin)
+            if pos is None:
+                print(f"[DONE] No open {coin} position remains. Canceling leftover reduce-only orders.")
+                await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+                return
+
+            try:
+                pos_size = float(pos.get("szi", "0"))
+            except (TypeError, ValueError):
+                print(f"[WARN] Could not parse current position: {pos}")
+                continue
+
+            if side_is_long and pos_size <= 0.0:
+                print(f"[DONE] Managed long {coin} is no longer open. Canceling leftovers.")
+                await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+                return
+            if (not side_is_long) and pos_size >= 0.0:
+                print(f"[DONE] Managed short {coin} is no longer open. Canceling leftovers.")
+                await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+                return
+
+            mids = await get_all_mids(info)
+            if coin not in mids:
+                print(f"[WARN] No mid price for {coin}; skipping this monitor tick.")
+                continue
+            price = float(mids[coin])
+
+            if side_is_long:
+                if favorable_extreme is None or price > favorable_extreme:
+                    favorable_extreme = price
+                if tp_trigger_px is not None and price >= tp_trigger_px:
+                    tp_zone_seen = True
+                reversal_hit = (
+                    tp_zone_seen
+                    and favorable_extreme is not None
+                    and price <= favorable_extreme * (1.0 - reversal_pct)
+                )
+            else:
+                if favorable_extreme is None or price < favorable_extreme:
+                    favorable_extreme = price
+                if tp_trigger_px is not None and price <= tp_trigger_px:
+                    tp_zone_seen = True
+                reversal_hit = (
+                    tp_zone_seen
+                    and favorable_extreme is not None
+                    and price >= favorable_extreme * (1.0 + reversal_pct)
+                )
+
+            extreme_str = f"{favorable_extreme:.8f}" if favorable_extreme is not None else "N/A"
+            print(
+                f"[MONITOR] {coin} side={side} pos={pos_size:.8f} mid={price:.8f} "
+                f"extreme={extreme_str} tp_zone_seen={tp_zone_seen}"
+            )
+
+            if reversal_hit:
+                print(
+                    f"[TP-REVERSAL] {coin} moved into TP zone and reversed by "
+                    f"{reversal_pct * 100:.4f}%. Canceling TP/SL orders and market-closing."
+                )
+                await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+                try:
+                    resp = await exchange.market_close(coin, slippage=market_slippage)
+                    print(f"[MARKET EXIT] response: {resp}")
+                except Exception as exc:
+                    print(f"[ERROR] Failed market close after TP reversal: {exc}")
+                    continue
+                await asyncio.sleep(max(0.25, poll_interval))
+                await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+                return
+    except KeyboardInterrupt:
+        print("\n[!] Caught Ctrl+C, leaving current open orders/position untouched and exiting monitor.")
+
+
+async def run_bracket_entry(
+    coin: str,
+    direction: str,
+    size: float,
+    take_profit_pct: Optional[float],
+    stop_loss_pct: Optional[float],
+    take_profit_levels: int,
+    entry_retries: int,
+    entry_repost_interval: float,
+    poll_interval: float,
+    tp_reversal_pct: Optional[float],
+    entry_tif: str,
+    tp_tif: str,
+    market_fallback: bool,
+    market_slippage: float,
+    cancel_existing_tpsl: bool,
+    use_testnet: bool,
+) -> None:
+    """Enter a position and manage bracket protection/exit logic."""
+    direction = direction.lower().strip()
+    if direction not in ("long", "short"):
+        raise RuntimeError("direction must be 'long' or 'short'.")
+    if size <= 0.0:
+        raise RuntimeError("size must be > 0.")
+    if take_profit_pct is None and stop_loss_pct is None:
+        raise RuntimeError("Specify --take-profit-pct, --stop-loss-pct, or both.")
+    if take_profit_pct is not None and not (0.0 < take_profit_pct < 1.0):
+        raise RuntimeError("--take-profit-pct must be a decimal fraction between 0 and 1.")
+
+    stop_loss_pct = compute_default_stop_loss_pct(take_profit_pct, stop_loss_pct)
+    if stop_loss_pct is not None and not (0.0 < stop_loss_pct < 1.0):
+        raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
+    if take_profit_levels <= 0:
+        raise RuntimeError("--take-profit-levels must be > 0.")
+    if entry_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("--entry-tif must be Alo or Gtc.")
+    if tp_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("--tp-tif must be Alo or Gtc.")
+
+    info: Optional[Info] = None
+    exchange: Optional[Exchange] = None
+    try:
+        account_address, info, exchange = await init_clients(use_testnet)
+        coin = coin.upper()
+        is_buy = direction == "long"
+
+        print("============================================================")
+        print(" Hyperliquid Async Bracket Entry Bot")
+        print("============================================================")
+        print(f"Account:           {account_address}")
+        print(f"Network:           {'TESTNET' if use_testnet else 'MAINNET'}")
+        print(f"Coin:              {coin}")
+        print(f"Direction:         {direction}")
+        print(f"Size:              {size}")
+        if take_profit_pct is not None:
+            print(f"Take profit pct:   {take_profit_pct * 100:.4f}%")
+        else:
+            print("Take profit pct:   N/A")
+        if stop_loss_pct is not None:
+            print(f"Stop loss pct:     {stop_loss_pct * 100:.4f}%")
+        else:
+            print("Stop loss pct:     N/A")
+        print(f"TP levels:         {take_profit_levels}")
+        print("============================================================")
+
+        if cancel_existing_tpsl:
+            await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+
+        pos = await enter_position_with_reposting_limit(
+            info=info,
+            exchange=exchange,
+            account_address=account_address,
+            coin=coin,
+            is_buy=is_buy,
+            size=size,
+            retries=entry_retries,
+            repost_interval=entry_repost_interval,
+            entry_tif=entry_tif,
+            market_fallback=market_fallback,
+            market_slippage=market_slippage,
+        )
+
+        try:
+            current_size = float(pos["szi"])
+            entry_px = float(pos["entryPx"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Could not parse opened position: {pos}. Error: {exc}") from exc
+
+        side = "long" if current_size > 0.0 else "short"
+        pos_abs = abs(current_size)
+        print(f"[OPEN] {coin} {side.upper()} size={pos_abs:.8f}, signed={current_size:.8f}, entry={entry_px:.8f}")
+
+        stop_oid: Optional[int] = None
+        if stop_loss_pct is not None:
+            stop_oid, _ = await place_stop_market_order(
+                info=info,
+                exchange=exchange,
+                coin=coin,
+                side=side,
+                position_size_abs=pos_abs,
+                entry_px=entry_px,
+                stop_loss_pct=stop_loss_pct,
+                slippage=market_slippage,
+            )
+
+        tp_orders: List[Dict[str, Any]] = []
+        tp_oids: List[int] = []
+        if take_profit_pct is not None:
+            tp_orders = await build_take_profit_ladder(
+                info=info,
+                coin=coin,
+                side=side,
+                position_size_abs=pos_abs,
+                entry_px=entry_px,
+                take_profit_pct=take_profit_pct,
+                levels=take_profit_levels,
+            )
+            tp_oids = await place_take_profit_ladder(exchange, coin, tp_orders, tp_tif)
+
+        await monitor_bracket_position(
+            info=info,
+            exchange=exchange,
+            account_address=account_address,
+            coin=coin,
+            side=side,
+            entry_px=entry_px,
+            take_profit_pct=take_profit_pct,
+            tp_orders=tp_orders,
+            tp_oids=tp_oids,
+            stop_oid=stop_oid,
+            poll_interval=poll_interval,
+            reversal_pct=tp_reversal_pct,
+            market_slippage=market_slippage,
+        )
+    finally:
+        await close_clients(info, exchange)
+
+
+async def attach_bracket_to_existing_position(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    position: Dict[str, Any],
+    take_profit_pct: Optional[float],
+    stop_loss_pct: Optional[float],
+    take_profit_levels: int,
+    poll_interval: float,
+    tp_reversal_pct: Optional[float],
+    tp_tif: str,
+    market_slippage: float,
+    cancel_existing_tpsl: bool,
+) -> None:
+    """Attach TP/SL orders to an already-open position and monitor it."""
+    coin = str(position.get("coin", "")).upper().strip()
+    if not coin:
+        raise RuntimeError(f"Cannot manage position without coin field: {position}")
+
+    try:
+        current_size = float(position["szi"])
+        entry_px = float(position["entryPx"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Could not parse open position for bracket attachment: {position}") from exc
+
+    if current_size == 0.0:
+        print(f"[WATCH] {coin} is already flat; nothing to attach.")
+        return
+
+    side = "long" if current_size > 0.0 else "short"
+    pos_abs = abs(current_size)
+
+    if take_profit_pct is None and stop_loss_pct is None:
+        raise RuntimeError("Specify --take-profit-pct, --stop-loss-pct, or both.")
+    if take_profit_pct is not None and not (0.0 < take_profit_pct < 1.0):
+        raise RuntimeError("--take-profit-pct must be a decimal fraction between 0 and 1.")
+    stop_loss_pct = compute_default_stop_loss_pct(take_profit_pct, stop_loss_pct)
+    if stop_loss_pct is not None and not (0.0 < stop_loss_pct < 1.0):
+        raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
+    if take_profit_levels <= 0:
+        raise RuntimeError("--take-profit-levels must be > 0.")
+    if tp_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("--tp-tif must be Alo or Gtc.")
+    if market_slippage < 0.0:
+        raise RuntimeError("--market-slippage must be >= 0.")
+
+    print("============================================================")
+    print(" Async Bracket Attach")
+    print("============================================================")
+    print(f"Account:          {account_address}")
+    print(f"Coin:             {coin}")
+    print(f"Side:             {side}")
+    print(f"Signed size:      {current_size:.8f}")
+    print(f"Managed size:     {pos_abs:.8f}")
+    print(f"Entry:            {entry_px:.8f}")
+    print(f"Take profit pct:  {take_profit_pct * 100:.4f}%" if take_profit_pct is not None else "Take profit pct:  N/A")
+    print(f"Stop loss pct:    {stop_loss_pct * 100:.4f}%" if stop_loss_pct is not None else "Stop loss pct:    N/A")
+    print(f"TP levels:        {take_profit_levels}")
+    print("============================================================")
+
+    if cancel_existing_tpsl:
+        await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+
+    stop_oid: Optional[int] = None
+    if stop_loss_pct is not None:
+        stop_oid, _ = await place_stop_market_order(
+            info=info,
+            exchange=exchange,
+            coin=coin,
+            side=side,
+            position_size_abs=pos_abs,
+            entry_px=entry_px,
+            stop_loss_pct=stop_loss_pct,
+            slippage=market_slippage,
+        )
+
+    tp_orders: List[Dict[str, Any]] = []
+    tp_oids: List[int] = []
+    if take_profit_pct is not None:
+        tp_orders = await build_take_profit_ladder(
+            info=info,
+            coin=coin,
+            side=side,
+            position_size_abs=pos_abs,
+            entry_px=entry_px,
+            take_profit_pct=take_profit_pct,
+            levels=take_profit_levels,
+        )
+        tp_oids = await place_take_profit_ladder(exchange, coin, tp_orders, tp_tif)
+
+    await monitor_bracket_position(
+        info=info,
+        exchange=exchange,
+        account_address=account_address,
+        coin=coin,
+        side=side,
+        entry_px=entry_px,
+        take_profit_pct=take_profit_pct,
+        tp_orders=tp_orders,
+        tp_oids=tp_oids,
+        stop_oid=stop_oid,
+        poll_interval=poll_interval,
+        reversal_pct=tp_reversal_pct,
+        market_slippage=market_slippage,
+    )
+
+
+async def _watched_position_task(
+    info: Info,
+    exchange: Exchange,
+    account_address: str,
+    position: Dict[str, Any],
+    take_profit_pct: Optional[float],
+    stop_loss_pct: Optional[float],
+    take_profit_levels: int,
+    poll_interval: float,
+    tp_reversal_pct: Optional[float],
+    tp_tif: str,
+    market_slippage: float,
+    cancel_existing_tpsl: bool,
+) -> None:
+    """Task wrapper for one watched position so watcher loop keeps running after errors."""
+    coin = str(position.get("coin", "UNKNOWN")).upper()
+    try:
+        await attach_bracket_to_existing_position(
+            info=info,
+            exchange=exchange,
+            account_address=account_address,
+            position=position,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_levels=take_profit_levels,
+            poll_interval=poll_interval,
+            tp_reversal_pct=tp_reversal_pct,
+            tp_tif=tp_tif,
+            market_slippage=market_slippage,
+            cancel_existing_tpsl=cancel_existing_tpsl,
+        )
+        print(f"[WATCH] Management task for {coin} finished.")
+    except asyncio.CancelledError:
+        print(f"[WATCH] Management task for {coin} canceled; leaving position/orders untouched.")
+        raise
+    except Exception as exc:
+        print(f"[WATCH-ERROR] Management task for {coin} failed: {exc}")
+
+
+async def run_position_watcher(
+    only_coin: Optional[str],
+    take_profit_pct: Optional[float],
+    stop_loss_pct: Optional[float],
+    take_profit_levels: int,
+    poll_interval: float,
+    tp_reversal_pct: Optional[float],
+    tp_tif: str,
+    market_slippage: float,
+    cancel_existing_tpsl: bool,
+    manage_existing: bool,
+    use_testnet: bool,
+) -> None:
+    """Watch account positions and attach TP/SL management to new open positions."""
+    if take_profit_pct is None and stop_loss_pct is None:
+        raise RuntimeError("Specify --take-profit-pct, --stop-loss-pct, or both.")
+    if take_profit_pct is not None and not (0.0 < take_profit_pct < 1.0):
+        raise RuntimeError("--take-profit-pct must be a decimal fraction between 0 and 1.")
+    stop_loss_pct = compute_default_stop_loss_pct(take_profit_pct, stop_loss_pct)
+    if stop_loss_pct is not None and not (0.0 < stop_loss_pct < 1.0):
+        raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
+    if take_profit_levels <= 0:
+        raise RuntimeError("--take-profit-levels must be > 0.")
+    if poll_interval <= 0.0:
+        raise RuntimeError("--poll-interval must be > 0.")
+    if tp_tif not in ("Alo", "Gtc"):
+        raise RuntimeError("--tp-tif must be Alo or Gtc.")
+    if market_slippage < 0.0:
+        raise RuntimeError("--market-slippage must be >= 0.")
+
+    normalized_only_coin = only_coin.upper() if only_coin else None
+    info: Optional[Info] = None
+    exchange: Optional[Exchange] = None
+    managed_tasks: Dict[str, asyncio.Task[None]] = {}
+    ignored_initial_coins: set[str] = set()
+
+    try:
+        account_address, info, exchange = await init_clients(use_testnet)
+        initial_positions = await get_all_open_positions(info, account_address)
+        if normalized_only_coin is not None:
+            initial_positions = [
+                pos for pos in initial_positions
+                if str(pos.get("coin", "")).upper() == normalized_only_coin
+            ]
+        ignored_initial_coins = {
+            str(pos.get("coin", "")).upper()
+            for pos in initial_positions
+            if str(pos.get("coin", "")).strip()
+        }
+
+        print("============================================================")
+        print(" Hyperliquid Async Position Watcher")
+        print("============================================================")
+        print(f"Account:           {account_address}")
+        print(f"Network:           {'TESTNET' if use_testnet else 'MAINNET'}")
+        print(f"Coin filter:       {normalized_only_coin if normalized_only_coin else 'ALL'}")
+        print(f"Take profit pct:   {take_profit_pct * 100:.4f}%" if take_profit_pct is not None else "Take profit pct:   N/A")
+        print(f"Stop loss pct:     {stop_loss_pct * 100:.4f}%" if stop_loss_pct is not None else "Stop loss pct:     N/A")
+        print(f"TP levels:         {take_profit_levels}")
+        print(f"Poll interval:     {poll_interval:.2f}s")
+        print(f"Manage existing:   {manage_existing}")
+        print("------------------------------------------------------------")
+        if ignored_initial_coins and not manage_existing:
+            print(
+                "[WATCH] Existing positions at startup will be ignored until they are flat and reopened: "
+                + ", ".join(sorted(ignored_initial_coins))
+            )
+        elif ignored_initial_coins and manage_existing:
+            print("[WATCH] Existing positions will be managed immediately: " + ", ".join(sorted(ignored_initial_coins)))
+        else:
+            print("[WATCH] No matching open positions at startup.")
+        print("Press Ctrl+C to stop watcher. Active positions/orders are left untouched.")
+        print("============================================================")
+
+        while True:
+            finished = [coin for coin, task in managed_tasks.items() if task.done()]
+            for coin in finished:
+                managed_tasks.pop(coin, None)
+
+            try:
+                positions = await get_all_open_positions(info, account_address)
+            except Exception as exc:
+                print(f"[WATCH-WARN] Failed to fetch open positions: {exc}")
+                await asyncio.sleep(poll_interval)
+                continue
+
+            current_open_coins: set[str] = set()
+            for pos in positions:
+                coin = str(pos.get("coin", "")).upper().strip()
+                if not coin:
+                    continue
+                if normalized_only_coin is not None and coin != normalized_only_coin:
+                    continue
+                current_open_coins.add(coin)
+
+                existing_task = managed_tasks.get(coin)
+                if existing_task is not None and not existing_task.done():
+                    continue
+
+                if not manage_existing and coin in ignored_initial_coins:
+                    continue
+
+                try:
+                    signed_size = float(pos.get("szi", "0"))
+                    entry_px = float(pos.get("entryPx", "0"))
+                except (TypeError, ValueError):
+                    print(f"[WATCH-WARN] Could not parse position for {coin}: {pos}")
+                    continue
+                side = "LONG" if signed_size > 0.0 else "SHORT"
+                print(
+                    f"[WATCH] New unmanaged position detected: {coin} {side} "
+                    f"signed_size={signed_size:.8f}, entry={entry_px:.8f}. Attaching TP/SL."
+                )
+                managed_tasks[coin] = asyncio.create_task(
+                    _watched_position_task(
+                        info=info,
+                        exchange=exchange,
+                        account_address=account_address,
+                        position=dict(pos),
+                        take_profit_pct=take_profit_pct,
+                        stop_loss_pct=stop_loss_pct,
+                        take_profit_levels=take_profit_levels,
+                        poll_interval=poll_interval,
+                        tp_reversal_pct=tp_reversal_pct,
+                        tp_tif=tp_tif,
+                        market_slippage=market_slippage,
+                        cancel_existing_tpsl=cancel_existing_tpsl,
+                    ),
+                    name=f"bracket-watch-{coin}",
+                )
+
+            for coin in list(ignored_initial_coins):
+                if coin not in current_open_coins:
+                    ignored_initial_coins.remove(coin)
+                    print(f"[WATCH] Startup position {coin} is now flat; a future reopened position will be managed.")
+
+            managed_label = ", ".join(sorted(managed_tasks)) if managed_tasks else "none"
+            ignored_label = ", ".join(sorted(ignored_initial_coins)) if ignored_initial_coins else "none"
+            print(f"[WATCH] open={sorted(current_open_coins)} managed={managed_label} ignored_startup={ignored_label}")
+            await asyncio.sleep(poll_interval)
+    except KeyboardInterrupt:
+        print("\n[!] Caught Ctrl+C, stopping position watcher.")
+    finally:
+        if managed_tasks:
+            print(f"[WATCH] Canceling {len(managed_tasks)} local monitor task(s); exchange orders are left untouched.")
+            for task in managed_tasks.values():
+                task.cancel()
+            await asyncio.gather(*managed_tasks.values(), return_exceptions=True)
+        await close_clients(info, exchange)
+
+
+# ---------------------------------------------------------------------------
+# Event-driven market maker
+# ---------------------------------------------------------------------------
+
+async def run_market_maker(
+    coin: str,
+    interval: str,
+    periods: int,
+    levels: int,
+    base_size: float,
+    use_testnet: bool,
+    loop_sleep: Optional[float],
+    min_edge_pct: float,
+    rebalance_threshold_pct: float,
+    protect_close_pct: float,
+) -> None:
+    """Market maker that only rebalances when price drifts away from current ladder."""
+    if levels <= 0:
+        raise RuntimeError("levels must be > 0")
+    if base_size <= 0.0:
+        raise RuntimeError("base-size must be > 0")
+    if interval not in INTERVAL_TO_MS:
+        raise RuntimeError(f"Unsupported interval {interval}. Valid: {sorted(INTERVAL_TO_MS.keys())}")
+    if min_edge_pct <= 0.0:
+        raise RuntimeError("min-edge-pct must be > 0")
+    if rebalance_threshold_pct <= 0.0:
+        raise RuntimeError("rebalance-threshold-pct must be > 0")
+    if protect_close_pct < 0.0:
+        raise RuntimeError("protect-close-pct must be >= 0")
+    if loop_sleep is None or loop_sleep <= 0.0:
+        loop_sleep = 1.0
+
+    info: Optional[Info] = None
+    exchange: Optional[Exchange] = None
+    try:
+        account_address, info, exchange = await init_clients(use_testnet)
+        coin = coin.upper()
+
+        print("============================================================")
+        print(" Hyperliquid Async Market Maker")
+        print("============================================================")
+        print(f"Account:        {account_address}")
+        print(f"Network:        {'TESTNET' if use_testnet else 'MAINNET'}")
+        print(f"Coin:           {coin}")
+        print(f"Interval:       {interval}")
+        print(f"Lookback N:     {periods} candles")
+        print(f"Levels/side:    {levels}")
+        print(f"Base size:      {base_size} contracts")
+        print(f"Poll interval:  {loop_sleep:.2f} seconds")
+        print(f"Min edge:       {min_edge_pct * 100:.4f}% vs mid")
+        print(f"Rebalance thr:  {rebalance_threshold_pct * 100:.4f}% mid vs ladder center")
+        print("============================================================")
+
+        loop_idx = 0
+        while True:
+            loop_idx += 1
+            await asyncio.sleep(loop_sleep)
+
+            try:
+                mids = await get_all_mids(info)
+                mid = float(mids.get(coin)) if coin in mids else None
+            except Exception as exc:
+                print(f"[WARN] Failed to fetch mids for {coin}: {exc}")
+                mid = None
+
+            coin_orders = await get_open_orders_for_coin(info, account_address, coin)
+            ladder_prices: List[float] = []
+            for order in coin_orders:
+                try:
+                    ladder_prices.append(float(extract_order_px(order)))
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+            need_rebalance = False
+            if mid is None or not ladder_prices:
+                need_rebalance = True
+                if mid is None and not ladder_prices:
+                    print(f"[LOOP {loop_idx}] No mid price and no ladder -> forcing rebalance.")
+                elif mid is None:
+                    print(f"[LOOP {loop_idx}] No mid price -> forcing rebalance.")
+                else:
+                    print(f"[LOOP {loop_idx}] No existing ladder for {coin} -> forcing rebalance.")
+            else:
+                ladder_min = min(ladder_prices)
+                ladder_max = max(ladder_prices)
+                ladder_center = 0.5 * (ladder_min + ladder_max)
+                deviation = abs(mid - ladder_center) / ladder_center if ladder_center > 0 else None
+                dev_str = "N/A" if deviation is None else f"{deviation * 100:.4f}%"
+                print(
+                    f"[LOOP {loop_idx}] mid={mid:.8f}, ladder_center={ladder_center:.8f}, "
+                    f"min={ladder_min:.8f}, max={ladder_max:.8f}, dev={dev_str}"
+                )
+                if deviation is None or deviation >= rebalance_threshold_pct:
+                    print("[MM] Rebalance condition met (price drifted from ladder).")
+                    need_rebalance = True
+                else:
+                    print("[MM] No rebalance needed this loop.")
+                    continue
+
+            if not need_rebalance:
+                continue
+
+            try:
+                pos_size = await get_position_size_for_coin(info, account_address, coin)
+            except Exception as exc:
+                print(f"[WARN] Failed to fetch current position for {coin}: {exc}")
+                pos_size = 0.0
+
+            pos_abs = abs(pos_size)
+            exit_chunk = pos_abs / levels if pos_abs > 0 else 0.0
+            if pos_size > 0:
+                print(f"[MM] Current position: LONG {pos_size:.8f}, exit chunk per level: {exit_chunk:.8f}")
+            elif pos_size < 0:
+                print(f"[MM] Current position: SHORT {pos_size:.8f}, exit chunk per level: {exit_chunk:.8f}")
+            else:
+                print("[MM] Current position: FLAT")
+
+            try:
+                candles = await fetch_recent_candles(info, coin, interval, periods)
+            except Exception as exc:
+                print(f"[ERROR] Failed to fetch candles for {coin}: {exc}")
+                continue
+
+            print(f"[MM] Fetched {len(candles)} candles for {coin} {interval}.")
+            try:
+                center, sigma = compute_center_and_sigma_from_candles(candles)
+            except Exception as exc:
+                print(f"[ERROR] Failed to compute center/sigma: {exc}")
+                continue
+
+            print(f"[MM] New center:  {center:.8f}")
+            print(f"[MM] New sigma:   {sigma:.8f}")
+
+            try:
+                mids = await get_all_mids(info)
+                mid = float(mids.get(coin)) if coin in mids else None
+            except Exception as exc:
+                print(f"[WARN] Failed to fetch mids for edge check: {exc}")
+                mid = None
+
+            if mid is not None:
+                print(f"[MM] Current mid: {mid:.8f}")
+            else:
+                print("[MM] Current mid: N/A")
+
+            best_bid, best_ask = await get_best_bid_ask(info, coin)
+            print(f"[MM] Best bid/ask:  {best_bid} / {best_ask}")
+
+            step = sigma / (levels + 1)
+            orders_to_place: List[Dict[str, Any]] = []
+
+            edge_buy_limit = mid * (1.0 - min_edge_pct) if mid is not None else None
+            base_buy_px = center - step
+            if edge_buy_limit is not None:
+                base_buy_px = min(base_buy_px, edge_buy_limit)
+
+            last_buy_px = None
+            for k in range(levels):
+                buy_px = base_buy_px - k * step
+                if best_bid is not None and buy_px >= best_bid:
+                    buy_px = best_bid - PRICE_EPS
+                if last_buy_px is not None and buy_px >= last_buy_px:
+                    buy_px = last_buy_px - PRICE_EPS
+                buy_size = exit_chunk if pos_size < 0 and exit_chunk > 0.0 else base_size * (k + 1)
+                if buy_px > 0 and buy_size > 0:
+                    buy_px_rounded = await round_price_for_hyperliquid(info, coin, buy_px)
+                    buy_size_rounded = await round_size_for_hyperliquid(info, coin, buy_size)
+                    orders_to_place.append({"coin": coin, "is_buy": True, "px": buy_px_rounded, "sz": buy_size_rounded})
+                    last_buy_px = buy_px_rounded
+
+            edge_sell_limit = mid * (1.0 + min_edge_pct) if mid is not None else None
+            base_sell_px = center + step
+            if edge_sell_limit is not None:
+                base_sell_px = max(base_sell_px, edge_sell_limit)
+
+            last_sell_px = None
+            for k in range(levels):
+                sell_px = base_sell_px + k * step
+                if best_ask is not None and sell_px <= best_ask:
+                    sell_px = best_ask + PRICE_EPS
+                if last_sell_px is not None and sell_px <= last_sell_px:
+                    sell_px = last_sell_px + PRICE_EPS
+                sell_size = exit_chunk if pos_size > 0 and exit_chunk > 0.0 else base_size * (k + 1)
+                if sell_px > 0 and sell_size > 0:
+                    sell_px_rounded = await round_price_for_hyperliquid(info, coin, sell_px)
+                    sell_size_rounded = await round_size_for_hyperliquid(info, coin, sell_size)
+                    orders_to_place.append({"coin": coin, "is_buy": False, "px": sell_px_rounded, "sz": sell_size_rounded})
+                    last_sell_px = sell_px_rounded
+
+            if not orders_to_place:
+                print("[MM] No valid prices generated for orders after spacing/edge checks.")
+                continue
+
+            print("[MM] Planned limit orders (post-only / ALO, spaced ladder, position-based sizing):")
+            for order in orders_to_place:
+                side = "BUY" if order["is_buy"] else "SELL"
+                print(f"  {side:4} {order['sz']:.8f} {coin} @ {order['px']:.8f}")
+            print("------------------------------------------------------------")
+
+            await cancel_open_orders_for_coin(
+                info,
+                exchange,
+                account_address,
+                coin,
+                existing_orders=coin_orders,
+                mid=mid,
+                protect_close_pct=protect_close_pct,
+            )
+
+            print(f"[MM] Placing {len(orders_to_place)} new orders for {coin}...")
+            for order in orders_to_place:
+                await place_order_with_retry(
+                    info,
+                    exchange,
+                    order["coin"],
+                    bool(order["is_buy"]),
+                    float(order["sz"]),
+                    float(order["px"]),
+                    max_retries=3,
+                )
+    except KeyboardInterrupt:
+        print("\n[!] Caught Ctrl+C, stopping market maker loop.")
+    finally:
+        await close_clients(info, exchange)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_optional_pct(value: Optional[str]) -> Optional[float]:
+    """argparse helper accepting omitted optional decimal fractions."""
+    if value is None:
+        return None
+    return float(value)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Async Hyperliquid CLI: trailing stop manager, bracket entry bot, and event-driven market maker.\n\n"
+            "Subcommands:\n"
+            "  trailing      Manage trailing stops for open perp positions.\n"
+            "  enter         Enter a position, place stop-market protection, and manage TP ladder.\n"
+            "  market_maker  Event-driven MM: build a pyramiding ladder around recent volatility."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    trailing_parser = subparsers.add_parser("trailing", help="Trailing stop manager for open perp positions.")
+    trailing_parser.add_argument("coin", type=str, nargs="?", default=None, help="Optional coin symbol, e.g. BTC, ETH.")
+    trailing_parser.add_argument("--trail-pct", type=float, default=0.01, help="Trailing distance fraction, e.g. 0.01 = 1pct.")
+    trailing_parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds. Default: 2.0.")
+    trailing_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
+
+    enter_parser = subparsers.add_parser(
+        "enter",
+        help="Enter a position with limit reposting, market fallback, stop-loss, and TP ladder.",
+    )
+    enter_parser.add_argument("coin", type=str, help="Perpetual coin symbol, e.g. BTC, ETH, HYPE.")
+    enter_parser.add_argument("direction", type=str, choices=["long", "short"], help="Direction to enter.")
+    enter_parser.add_argument("--size", type=float, required=True, help="Contract size to enter.")
+    enter_parser.add_argument("--take-profit-pct", type=float, default=None, help="Take-profit target fraction, e.g. 0.01 = 1pct.")
+    enter_parser.add_argument("--stop-loss-pct", type=float, default=None, help="Stop-loss fraction. If omitted with TP, defaults to TP * 0.5.")
+    enter_parser.add_argument("--take-profit-levels", type=int, default=4, help="Number of weighted TP limit levels. Default: 4.")
+    enter_parser.add_argument("--entry-retries", type=int, default=5, help="Number of top-of-book limit repost attempts. Default: 5.")
+    enter_parser.add_argument("--entry-repost-interval", type=float, default=1.0, help="Seconds between entry reposts. Default: 1.0.")
+    enter_parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between bracket monitor polls. Default: 1.0.")
+    enter_parser.add_argument("--tp-reversal-pct", type=float, default=None, help="Market-exit if price reverses this fraction after first TP zone.")
+    enter_parser.add_argument("--entry-tif", type=str, default="Alo", choices=["Alo", "Gtc"], help="Entry limit TIF. Default: Alo.")
+    enter_parser.add_argument("--tp-tif", type=str, default="Alo", choices=["Alo", "Gtc"], help="Take-profit limit TIF. Default: Alo.")
+    enter_parser.add_argument("--no-market-fallback", action="store_true", help="Do not fall back to market entry after limit retries.")
+    enter_parser.add_argument("--market-slippage", type=float, default=0.05, help="Slippage fraction for market-style entry/exit. Default: 0.05.")
+    enter_parser.add_argument("--keep-existing-tpsl", action="store_true", help="Do not cancel existing reduce-only TP/SL orders before entry.")
+    enter_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
+
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Watch for newly opened positions and automatically attach stop-loss and take-profit management.",
+    )
+    watch_parser.add_argument("coin", type=str, nargs="?", default=None, help="Optional coin symbol to watch, e.g. BTC. Omit to watch all coins.")
+    watch_parser.add_argument("--take-profit-pct", type=float, default=None, help="Take-profit target fraction, e.g. 0.01 = 1pct.")
+    watch_parser.add_argument("--stop-loss-pct", type=float, default=None, help="Stop-loss fraction. If omitted with TP, defaults to TP * 0.5.")
+    watch_parser.add_argument("--take-profit-levels", type=int, default=4, help="Number of weighted TP limit levels. Default: 4.")
+    watch_parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between watcher/position monitor polls. Default: 1.0.")
+    watch_parser.add_argument("--tp-reversal-pct", type=float, default=None, help="Market-exit if price reverses this fraction after first TP zone.")
+    watch_parser.add_argument("--tp-tif", type=str, default="Alo", choices=["Alo", "Gtc"], help="Take-profit limit TIF. Default: Alo.")
+    watch_parser.add_argument("--market-slippage", type=float, default=0.05, help="Slippage fraction for market-style exits. Default: 0.05.")
+    watch_parser.add_argument("--keep-existing-tpsl", action="store_true", help="Do not cancel existing reduce-only TP/SL orders before attaching new ones.")
+    watch_parser.add_argument("--manage-existing", action="store_true", help="Also attach TP/SL to matching positions already open at startup.")
+    watch_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
+
+    mm_parser = subparsers.add_parser(
+        "market_maker",
+        help="Event-driven market maker using async SDK calls.",
+    )
+    mm_parser.add_argument("coin", type=str, help="Perpetual coin symbol, e.g. BTC, ETH, kPEPE.")
+    mm_parser.add_argument("--interval", type=str, default="1m", choices=sorted(INTERVAL_TO_MS.keys()), help="Candle interval. Default: 1m.")
+    mm_parser.add_argument("--periods", type=int, default=12, help="Recent candle count for stddev. Default: 12.")
+    mm_parser.add_argument("--levels", type=int, default=4, help="Number of pyramid levels per side. Default: 4.")
+    mm_parser.add_argument("--base-size", type=float, default=0.01, help="Base contract size for closest level. Default: 0.01.")
+    mm_parser.add_argument("--loop-sleep", type=float, default=1.0, help="Seconds between MM checks. Default: 1.0.")
+    mm_parser.add_argument("--min-edge-pct", type=float, default=0.0005, help="Minimum edge vs mid as fraction. Default: 0.0005.")
+    mm_parser.add_argument("--rebalance-threshold-pct", type=float, default=0.001, help="Mid-vs-ladder-center drift threshold. Default: 0.001.")
+    mm_parser.add_argument("--protect-close-pct", type=float, default=0.0005, help="Do not cancel orders within this mid band. Default: 0.0005.")
+    mm_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
+
+    return parser
+
+
+async def async_main(argv: Optional[List[str]] = None) -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "trailing":
+        if args.trail_pct <= 0.0:
+            print("[ERROR] --trail-pct must be > 0.")
+            sys.exit(1)
+        if args.poll_interval <= 0.0:
+            print("[ERROR] --poll-interval must be > 0.")
+            sys.exit(1)
+        await trailing_stop_for_all_positions(
+            trail_pct=args.trail_pct,
+            poll_interval=args.poll_interval,
+            use_testnet=args.testnet,
+            only_coin=(args.coin.upper() if args.coin is not None else None),
+        )
+        return
+
+    if args.command == "enter":
+        if args.size <= 0.0:
+            print("[ERROR] --size must be > 0.")
+            sys.exit(1)
+        if args.take_profit_pct is None and args.stop_loss_pct is None:
+            print("[ERROR] Specify --take-profit-pct, --stop-loss-pct, or both.")
+            sys.exit(1)
+        if args.take_profit_levels <= 0:
+            print("[ERROR] --take-profit-levels must be > 0.")
+            sys.exit(1)
+        if args.entry_retries < 0:
+            print("[ERROR] --entry-retries must be >= 0.")
+            sys.exit(1)
+        if args.entry_repost_interval <= 0.0:
+            print("[ERROR] --entry-repost-interval must be > 0.")
+            sys.exit(1)
+        if args.poll_interval <= 0.0:
+            print("[ERROR] --poll-interval must be > 0.")
+            sys.exit(1)
+        if args.market_slippage < 0.0:
+            print("[ERROR] --market-slippage must be >= 0.")
+            sys.exit(1)
+
+        await run_bracket_entry(
+            coin=args.coin.upper(),
+            direction=args.direction,
+            size=args.size,
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_levels=args.take_profit_levels,
+            entry_retries=args.entry_retries,
+            entry_repost_interval=args.entry_repost_interval,
+            poll_interval=args.poll_interval,
+            tp_reversal_pct=args.tp_reversal_pct,
+            entry_tif=args.entry_tif,
+            tp_tif=args.tp_tif,
+            market_fallback=(not args.no_market_fallback),
+            market_slippage=args.market_slippage,
+            cancel_existing_tpsl=(not args.keep_existing_tpsl),
+            use_testnet=args.testnet,
+        )
+        return
+
+    if args.command == "watch":
+        if args.take_profit_pct is None and args.stop_loss_pct is None:
+            print("[ERROR] Specify --take-profit-pct, --stop-loss-pct, or both.")
+            sys.exit(1)
+        if args.take_profit_levels <= 0:
+            print("[ERROR] --take-profit-levels must be > 0.")
+            sys.exit(1)
+        if args.poll_interval <= 0.0:
+            print("[ERROR] --poll-interval must be > 0.")
+            sys.exit(1)
+        if args.market_slippage < 0.0:
+            print("[ERROR] --market-slippage must be >= 0.")
+            sys.exit(1)
+
+        await run_position_watcher(
+            only_coin=(args.coin.upper() if args.coin is not None else None),
+            take_profit_pct=args.take_profit_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_levels=args.take_profit_levels,
+            poll_interval=args.poll_interval,
+            tp_reversal_pct=args.tp_reversal_pct,
+            tp_tif=args.tp_tif,
+            market_slippage=args.market_slippage,
+            cancel_existing_tpsl=(not args.keep_existing_tpsl),
+            manage_existing=args.manage_existing,
+            use_testnet=args.testnet,
+        )
+        return
+
+    if args.command == "market_maker":
+        if args.periods <= 0:
+            print("[ERROR] --periods must be > 0.")
+            sys.exit(1)
+        if args.levels <= 0:
+            print("[ERROR] --levels must be > 0.")
+            sys.exit(1)
+        if args.base_size <= 0:
+            print("[ERROR] --base-size must be > 0.")
+            sys.exit(1)
+        if args.min_edge_pct <= 0:
+            print("[ERROR] --min-edge-pct must be > 0.")
+            sys.exit(1)
+        if args.rebalance_threshold_pct <= 0:
+            print("[ERROR] --rebalance-threshold-pct must be > 0.")
+            sys.exit(1)
+        await run_market_maker(
+            coin=args.coin.upper(),
+            interval=args.interval,
+            periods=args.periods,
+            levels=args.levels,
+            base_size=args.base_size,
+            use_testnet=args.testnet,
+            loop_sleep=args.loop_sleep,
+            min_edge_pct=args.min_edge_pct,
+            rebalance_threshold_pct=args.rebalance_threshold_pct,
+            protect_close_pct=args.protect_close_pct,
+        )
+        return
+
+    parser.print_help()
+    sys.exit(1)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    try:
+        asyncio.run(async_main(argv))
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted.")
+    except Exception as exc:
+        print(f"[FATAL] {exc}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
