@@ -266,7 +266,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Comma/space separated intervals. Default: 1h,15m,5m,1m.")
     auto_parser.add_argument("--auto-periods", type=int, default=200,
                              help="Candles per interval for TA-Lib indicators. Default: 200.")
-    auto_parser.add_argument("--scan-interval", type=float, default=1,
+    auto_parser.add_argument("--scan-interval", type=float, default=30,
                              help="Seconds between signal scans. Default: 30.0.")
     auto_parser.add_argument("--max-concurrent-scans", type=int, default=3,
                              help="Maximum markets to scan concurrently per auto loop. Default: 3.")
