@@ -23,7 +23,6 @@ async def attach_bracket_to_existing_position(
     take_profit_levels: int,
     use_trailing_tp: bool,
     trailing_tp_trigger_level: int,
-    trailing_tp_remaining_levels: int,
     trailing_tp_profit_pct: float,
     poll_interval: float,
     tp_reversal_pct: Optional[float],
@@ -62,8 +61,6 @@ async def attach_bracket_to_existing_position(
         raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
     if take_profit_levels <= 0:
         raise RuntimeError("--take-profit-levels must be > 0.")
-    if trailing_tp_remaining_levels < 0:
-        raise RuntimeError("--trailing-tp-remaining-levels must be >= 0.")
     if trailing_tp_trigger_level <= 0:
         raise RuntimeError("--trailing-tp-trigger-level must be > 0.")
     if trailing_tp_trigger_level > take_profit_levels:
@@ -90,11 +87,6 @@ async def attach_bracket_to_existing_position(
     if use_trailing_tp:
         print(f"Trailing TP level: {trailing_tp_trigger_level}")
         print(f"Trailing TP pct:  {trailing_tp_profit_pct * 100:.4f}%")
-    elif trailing_tp_remaining_levels > 0:
-        print(
-            f"Trailing TP switch:{trailing_tp_remaining_levels} remaining TP level(s) -> "
-            f"trail {trailing_tp_profit_pct * 100:.4f}%"
-        )
     print(f"Stop loss pct:    {stop_loss_pct * 100:.4f}%" if stop_loss_pct is not None else "Stop loss pct:    N/A")
     print(f"TP levels:        {take_profit_levels}")
     print("============================================================")
@@ -146,7 +138,6 @@ async def attach_bracket_to_existing_position(
         hide_orders=hide_orders,
         use_trailing_tp=use_trailing_tp,
         trailing_tp_trigger_level=trailing_tp_trigger_level,
-        trailing_tp_remaining_levels=trailing_tp_remaining_levels,
         trailing_tp_profit_pct=trailing_tp_profit_pct,
         metrics_start_time_ms=metrics_start_time_ms,
     )
@@ -161,7 +152,6 @@ async def _watched_position_task(
     take_profit_levels: int,
     use_trailing_tp: bool,
     trailing_tp_trigger_level: int,
-    trailing_tp_remaining_levels: int,
     trailing_tp_profit_pct: float,
     poll_interval: float,
     tp_reversal_pct: Optional[float],
@@ -188,7 +178,6 @@ async def _watched_position_task(
                     take_profit_levels=take_profit_levels,
                     use_trailing_tp=use_trailing_tp,
                     trailing_tp_trigger_level=trailing_tp_trigger_level,
-                    trailing_tp_remaining_levels=trailing_tp_remaining_levels,
                     trailing_tp_profit_pct=trailing_tp_profit_pct,
                     poll_interval=poll_interval,
                     tp_reversal_pct=tp_reversal_pct,
@@ -224,7 +213,6 @@ async def run_position_watcher(
     take_profit_levels: int,
     use_trailing_tp: bool,
     trailing_tp_trigger_level: int,
-    trailing_tp_remaining_levels: int,
     trailing_tp_profit_pct: float,
     poll_interval: float,
     tp_reversal_pct: Optional[float],
@@ -237,6 +225,9 @@ async def run_position_watcher(
     use_testnet: bool,
     use_websocket: bool = True,
     hide_orders: bool = False,
+    account_address: Optional[str] = None,
+    info: Optional[Info] = None,
+    exchange: Optional[Exchange] = None,
 ) -> None:
     """Watch account positions and attach TP/SL management to new open positions."""
     if take_profit_pct is None and stop_loss_pct is None:
@@ -248,8 +239,6 @@ async def run_position_watcher(
         raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
     if take_profit_levels <= 0:
         raise RuntimeError("--take-profit-levels must be > 0.")
-    if trailing_tp_remaining_levels < 0:
-        raise RuntimeError("--trailing-tp-remaining-levels must be >= 0.")
     if trailing_tp_trigger_level <= 0:
         raise RuntimeError("--trailing-tp-trigger-level must be > 0.")
     if trailing_tp_trigger_level > take_profit_levels:
@@ -264,13 +253,15 @@ async def run_position_watcher(
         raise RuntimeError("--market-slippage must be >= 0.")
 
     normalized_only_coin = only_coin.upper() if only_coin else None
-    info: Optional[Info] = None
-    exchange: Optional[Exchange] = None
+    owns_clients = account_address is None and info is None and exchange is None
+    if not owns_clients and (account_address is None or info is None or exchange is None):
+        raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     managed_tasks: Dict[str, asyncio.Task[None]] = {}
     ignored_initial_coins: set[str] = set()
 
     try:
-        account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        if owns_clients:
+            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         metrics_start_time_ms = int(time.time() * 1000)
         initial_positions = await get_all_open_positions(info, account_address)
         if normalized_only_coin is not None:
@@ -297,11 +288,6 @@ async def run_position_watcher(
         if use_trailing_tp:
             print(f"Trailing TP level: {trailing_tp_trigger_level}")
             print(f"Trailing TP pct:   {trailing_tp_profit_pct * 100:.4f}%")
-        elif trailing_tp_remaining_levels > 0:
-            print(
-                f"Trailing TP switch:{trailing_tp_remaining_levels} remaining TP level(s) -> "
-                f"trail {trailing_tp_profit_pct * 100:.4f}%"
-            )
         print(f"Stop loss pct:     {stop_loss_pct * 100:.4f}%" if stop_loss_pct is not None else "Stop loss pct:     N/A")
         print(f"TP levels:         {take_profit_levels}")
         print(f"Poll interval:     {poll_interval:.2f}s")
@@ -390,7 +376,6 @@ async def run_position_watcher(
                         take_profit_levels=take_profit_levels,
                         use_trailing_tp=use_trailing_tp,
                         trailing_tp_trigger_level=trailing_tp_trigger_level,
-                        trailing_tp_remaining_levels=trailing_tp_remaining_levels,
                         trailing_tp_profit_pct=trailing_tp_profit_pct,
                         poll_interval=poll_interval,
                         tp_reversal_pct=tp_reversal_pct,
@@ -422,4 +407,5 @@ async def run_position_watcher(
             for task in managed_tasks.values():
                 task.cancel()
             await asyncio.gather(*managed_tasks.values(), return_exceptions=True)
-        await close_clients(info, exchange)
+        if owns_clients:
+            await close_clients(info, exchange)

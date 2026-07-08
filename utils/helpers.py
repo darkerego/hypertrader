@@ -134,6 +134,12 @@ class HyperliquidWebsocketCache:
         self._order_updates_sub_id: Optional[int] = None
         self.last_user_event: Optional[Dict[str, Any]] = None
         self.last_order_update: Optional[Dict[str, Any]] = None
+        self._candle_buffers: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        self._candle_requested_periods: Dict[Tuple[str, str], int] = {}
+        self._candle_updated_at: Dict[Tuple[str, str], float] = {}
+        self._candle_ready: Dict[Tuple[str, str], asyncio.Event] = {}
+        self._candle_sub_ids: Dict[Tuple[str, str], int] = {}
+        self._candle_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
     @staticmethod
     def _coin_keys(coin: str) -> Tuple[str, str]:
@@ -161,6 +167,42 @@ class HyperliquidWebsocketCache:
         except (TypeError, ValueError):
             return None
         return None
+
+    @staticmethod
+    def _normalize_candle_key(coin: str, interval: str) -> Tuple[str, str]:
+        return str(coin).upper(), str(interval)
+
+    @staticmethod
+    def _extract_candle_start_ms(candle: Dict[str, Any]) -> Optional[int]:
+        try:
+            return int(candle["t"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _merge_candles(
+        self,
+        key: Tuple[str, str],
+        candles: List[Dict[str, Any]],
+    ) -> None:
+        if not candles:
+            return
+
+        merged: Dict[int, Dict[str, Any]] = {}
+        for existing in self._candle_buffers.get(key, []):
+            start_ms = self._extract_candle_start_ms(existing)
+            if start_ms is not None:
+                merged[start_ms] = existing
+
+        for candle in candles:
+            start_ms = self._extract_candle_start_ms(candle)
+            if start_ms is not None:
+                merged[start_ms] = dict(candle)
+
+        keep = max(1, self._candle_requested_periods.get(key, len(merged)))
+        ordered = [merged[start_ms] for start_ms in sorted(merged)]
+        self._candle_buffers[key] = ordered[-keep:]
+        self._candle_updated_at[key] = time.monotonic()
+        self._candle_ready.setdefault(key, asyncio.Event()).set()
 
     async def start(self) -> None:
         """Start default websocket subscriptions. Safe to call even when disabled."""
@@ -204,6 +246,10 @@ class HyperliquidWebsocketCache:
         ]
         for coin, sub_id in list(self._bbo_sub_ids.items()):
             unsubscribe_specs.append(({"type": "bbo", "coin": coin}, sub_id, f"bbo:{coin}"))
+        for (coin, interval), sub_id in list(self._candle_sub_ids.items()):
+            unsubscribe_specs.append(
+                ({"type": "candle", "coin": coin, "interval": interval}, sub_id, f"candle:{coin},{interval}")
+            )
 
         for subscription, sub_id, label in unsubscribe_specs:
             if sub_id is None:
@@ -264,6 +310,19 @@ class HyperliquidWebsocketCache:
     def _on_order_update(self, msg: Dict[str, Any]) -> None:
         self.last_order_update = msg
 
+    def _on_candle(self, requested_coin: str, requested_interval: str, msg: Dict[str, Any]) -> None:
+        data = msg.get("data", {}) if isinstance(msg, dict) else {}
+        if not isinstance(data, dict):
+            return
+        interval = str(data.get("i") or requested_interval)
+        if interval != requested_interval:
+            return
+        candle = dict(data)
+        candle["s"] = str(data.get("s") or requested_coin).upper()
+        candle["i"] = interval
+        key = self._normalize_candle_key(requested_coin, requested_interval)
+        self._merge_candles(key, [candle])
+
     async def get_all_mids(self) -> Optional[Dict[str, float]]:
         if not self.enabled:
             return None
@@ -316,6 +375,53 @@ class HyperliquidWebsocketCache:
             if self._is_fresh(updated_at, self.max_age_seconds) and key in self._bbo:
                 return self._bbo[key]
         return None
+
+    async def ensure_candle_subscription(self, coin: str, interval: str, periods: int) -> None:
+        if not self.enabled:
+            return
+
+        key = self._normalize_candle_key(coin, interval)
+        self._candle_requested_periods[key] = max(periods, self._candle_requested_periods.get(key, 0))
+        self._candle_ready.setdefault(key, asyncio.Event())
+        lock = self._candle_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._candle_sub_ids:
+                try:
+                    sub_id = await self.info.subscribe(
+                        {"type": "candle", "coin": coin, "interval": interval},
+                        lambda msg, c=coin, i=interval: self._on_candle(c, i, msg),
+                    )
+                    self._candle_sub_ids[key] = sub_id
+                    print(f"[WS] Subscribed to candle:{coin},{interval} (subscription id {sub_id}).")
+                except Exception as exc:
+                    print(
+                        f"[WS-WARN] candle subscription failed for {coin} {interval}; "
+                        f"HTTP candle fallback will be used: {exc}"
+                    )
+                    return
+
+            if len(self._candle_buffers.get(key, [])) >= periods:
+                return
+
+            now_ms = int(time.time() * 1000)
+            interval_ms = INTERVAL_TO_MS[interval]
+            window_ms = interval_ms * periods * 2
+            start_time = now_ms - window_ms
+            end_time = now_ms
+            data = await self.info.candles_snapshot(coin, interval, start_time, end_time)
+            if not isinstance(data, list) or not data:
+                raise RuntimeError(f"No candle data returned for {coin} {interval}.")
+            self._merge_candles(key, data[-periods:])
+
+    async def get_recent_candles(self, coin: str, interval: str, periods: int) -> Optional[List[Dict[str, Any]]]:
+        if not self.enabled:
+            return None
+        await self.ensure_candle_subscription(coin, interval, periods)
+        key = self._normalize_candle_key(coin, interval)
+        candles = self._candle_buffers.get(key, [])
+        if len(candles) < periods:
+            return None
+        return [dict(candle) for candle in candles[-periods:]]
 
 
 def get_ws_cache(info: Info) -> Optional[HyperliquidWebsocketCache]:
@@ -645,12 +751,20 @@ async def fetch_recent_candles(
         coin: str,
         interval: str,
         periods: int,
+        use_websocket_candles: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch the last `periods` candles using the async SDK candleSnapshot helper."""
     if interval not in INTERVAL_TO_MS:
         raise RuntimeError(f"Unsupported interval {interval}. Valid: {sorted(INTERVAL_TO_MS.keys())}")
     if periods <= 0:
         raise RuntimeError("periods must be > 0")
+
+    if use_websocket_candles:
+        cache = get_ws_cache(info)
+        if cache is not None and cache.enabled:
+            cached_candles = await cache.get_recent_candles(coin, interval, periods)
+            if cached_candles is not None:
+                return cached_candles
 
     now_ms = int(time.time() * 1000)
     interval_ms = INTERVAL_TO_MS[interval]

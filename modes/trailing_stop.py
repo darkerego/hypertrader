@@ -20,6 +20,9 @@ async def trailing_stop_for_all_positions(
     only_coin: Optional[str] = None,
     use_websocket: bool = True,
     hide_orders: bool = False,
+    account_address: Optional[str] = None,
+    info: Optional[Info] = None,
+    exchange: Optional[Exchange] = None,
 ) -> None:
     """Trailing stop manager for all open positions or one coin.
 
@@ -50,10 +53,12 @@ async def trailing_stop_for_all_positions(
         else:
             st["stop"] = entry
 
-    info: Optional[Info] = None
-    exchange: Optional[Exchange] = None
+    owns_clients = account_address is None and info is None and exchange is None
+    if not owns_clients and (account_address is None or info is None or exchange is None):
+        raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     try:
-        account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        if owns_clients:
+            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         metrics_start_time_ms = int(time.time() * 1000)
         open_positions = await get_all_open_positions(info, account_address)
         if only_coin is not None:
@@ -268,4 +273,5 @@ async def trailing_stop_for_all_positions(
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, exiting without closing remaining positions.")
     finally:
-        await close_clients(info, exchange)
+        if owns_clients:
+            await close_clients(info, exchange)

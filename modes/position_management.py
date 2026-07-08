@@ -714,23 +714,23 @@ async def enter_position_with_reposting_limit(
 
     async def get_entry_progress() -> Tuple[float, float, float, str, AccountRuntimeMetrics]:
         """Return current_pos, filled_delta, remaining_size, formatted uPnL, account metrics."""
-        current_pos = await get_position_size_for_coin(info, account_address, coin)
-        filled_delta = signed_position_delta(initial_pos, current_pos, is_buy)
+        _current_pos = await get_position_size_for_coin(info, account_address, coin)
+        filled_delta = signed_position_delta(initial_pos, _current_pos, is_buy)
         remaining_size = max(0.0, size - filled_delta)
 
         pos_snapshot = await get_position_for_coin(info, account_address, coin)
         mids = await get_all_mids(info)
         mid_price_raw = mids.get(coin)
-        upnl_str = "N/A"
+        _upnl_str = "N/A"
         if pos_snapshot is not None and mid_price_raw is not None:
             try:
                 unrealized_pnl = compute_position_unrealized_pnl(pos_snapshot, float(mid_price_raw))
             except (TypeError, ValueError):
                 unrealized_pnl = None
             if unrealized_pnl is not None:
-                upnl_str = f"{unrealized_pnl:.8f}"
-        metrics = await get_account_runtime_metrics(info, account_address, metrics_start_time_ms, coin=coin)
-        return current_pos, filled_delta, remaining_size, upnl_str, metrics
+                _upnl_str = f"{unrealized_pnl:.8f}"
+        _metrics = await get_account_runtime_metrics(info, account_address, metrics_start_time_ms, coin=coin)
+        return _current_pos, filled_delta, remaining_size, _upnl_str, _metrics
 
     async def cancel_active_entry_order(label: str, reconcile: bool = False) -> None:
         nonlocal active_oid
@@ -943,12 +943,45 @@ async def compute_auto_sar_stop_trigger_px(
         sar_acceleration: float,
         sar_maximum: float,
         use_last_closed_candle: bool,
+        use_websocket_candles: bool = False,
 ) -> Optional[float]:
     """Compute the latest protective SAR stop for an active auto-managed position."""
+    sar_stop_px, _, _, _ = await compute_auto_sar_stop_state(
+        info=info,
+        coin=coin,
+        side=side,
+        interval=interval,
+        periods=periods,
+        sar_acceleration=sar_acceleration,
+        sar_maximum=sar_maximum,
+        use_last_closed_candle=use_last_closed_candle,
+        use_websocket_candles=use_websocket_candles,
+    )
+    return sar_stop_px
+
+
+async def compute_auto_sar_stop_state(
+        info: Info,
+        coin: str,
+        side: str,
+        interval: str,
+        periods: int,
+        sar_acceleration: float,
+        sar_maximum: float,
+        use_last_closed_candle: bool,
+        use_websocket_candles: bool = False,
+) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
+    """Return the latest SAR stop candidate and whether the SAR flipped against the position."""
     if np is None or talib is None:
         raise RuntimeError("Dynamic auto SAR stop updates require numpy and TA-Lib.")
 
-    candles = await fetch_recent_candles(info, coin, interval, periods)
+    candles = await fetch_recent_candles(
+        info,
+        coin,
+        interval,
+        periods,
+        use_websocket_candles=use_websocket_candles,
+    )
     usable_candles = candles[:-1] if use_last_closed_candle and len(candles) > 1 else candles
     highs: List[float] = []
     lows: List[float] = []
@@ -983,12 +1016,16 @@ async def compute_auto_sar_stop_trigger_px(
         candidate = float(sar_value)
         close_px = float(close_value)
         if side == "long" and candidate < close_px:
-            return candidate
+            return candidate, candidate, close_px, False
         if side == "short" and candidate > close_px:
-            return candidate
-        return None
+            return candidate, candidate, close_px, False
+        if side == "long":
+            return None, candidate, close_px, candidate >= close_px
+        if side == "short":
+            return None, candidate, close_px, candidate <= close_px
+        raise RuntimeError(f"Invalid side: {side}")
 
-    return None
+    return None, None, None, False
 
 
 async def monitor_bracket_position(
@@ -1015,7 +1052,6 @@ async def monitor_bracket_position(
         hide_orders: bool = False,
         use_trailing_tp: bool = False,
         trailing_tp_trigger_level: int = 1,
-        trailing_tp_remaining_levels: int = 0,
         trailing_tp_profit_pct: float = 0.25,
         metrics_start_time_ms: Optional[int] = None,
         auto_sar_stop_interval: Optional[str] = None,
@@ -1023,6 +1059,7 @@ async def monitor_bracket_position(
         auto_sar_acceleration: Optional[float] = None,
         auto_sar_maximum: Optional[float] = None,
         auto_use_last_closed_candle: bool = True,
+        auto_use_websocket_candles: bool = False,
 ) -> None:
     """Monitor bracket orders, display PnL/account metrics, and manage hidden/public TP/SL."""
     if poll_interval <= 0.0:
@@ -1030,8 +1067,6 @@ async def monitor_bracket_position(
     tp_reversal_enabled = reversal_pct is not None
     if tp_reversal_enabled and not (0.0 < reversal_pct < 1.0):
         raise RuntimeError("reversal_pct must be a decimal fraction between 0 and 1.")
-    if trailing_tp_remaining_levels < 0:
-        raise RuntimeError("trailing_tp_remaining_levels must be >= 0.")
     if trailing_tp_trigger_level <= 0:
         raise RuntimeError("trailing_tp_trigger_level must be > 0.")
 
@@ -1048,11 +1083,6 @@ async def monitor_bracket_position(
     stop_source = "none"
     trailing_tp_armed = False
     trailing_tp_stop_px: Optional[float] = None
-    hybrid_trailing_tp_enabled = (
-        (not use_trailing_tp)
-        and trailing_tp_remaining_levels > 0
-        and len(tp_orders) > trailing_tp_remaining_levels
-    )
     dynamic_auto_sar_stop_enabled = (
         auto_sar_stop_interval is not None
         and auto_sar_stop_periods is not None
@@ -1074,11 +1104,6 @@ async def monitor_bracket_position(
     if use_trailing_tp:
         print(f"Trailing TP level: {trailing_tp_trigger_level}")
         print(f"Trailing TP pct:   {trailing_tp_profit_pct * 100:.4f}%")
-    elif hybrid_trailing_tp_enabled:
-        print(
-            f"Trailing TP switch:{trailing_tp_remaining_levels} remaining TP level(s) -> "
-            f"trail {trailing_tp_profit_pct * 100:.4f}%"
-        )
     print(
         f"Local stop px:     {fmt_optional_float(local_stop_px)} ({stop_source})"
         if hide_orders
@@ -1105,6 +1130,7 @@ async def monitor_bracket_position(
             f"Auto SAR stop:     {auto_sar_stop_interval} "
             f"(periods={auto_sar_stop_periods}, closed_only={auto_use_last_closed_candle})"
         )
+        print(f"Auto SAR WS:       {auto_use_websocket_candles}")
     print("------------------------------------------------------------")
     print("Press Ctrl+C to stop monitoring without closing the position.")
     print("============================================================")
@@ -1196,7 +1222,7 @@ async def monitor_bracket_position(
 
                 if dynamic_auto_sar_stop_enabled:
                     try:
-                        updated_sar_stop_px = await compute_auto_sar_stop_trigger_px(
+                        updated_sar_stop_px, latest_sar_px, latest_sar_close_px, sar_flip_exit = await compute_auto_sar_stop_state(
                             info=info,
                             coin=coin,
                             side=side,
@@ -1205,10 +1231,31 @@ async def monitor_bracket_position(
                             sar_acceleration=auto_sar_acceleration,
                             sar_maximum=auto_sar_maximum,
                             use_last_closed_candle=auto_use_last_closed_candle,
+                            use_websocket_candles=auto_use_websocket_candles,
                         )
                     except Exception as exc:
                         print(f"[SL-SAR-WARN] Failed to refresh SAR stop for {coin}: {exc}")
                     else:
+                        if sar_flip_exit:
+                            print(
+                                f"[SL-SAR] {coin} SAR flipped against {side} position: "
+                                f"sar={fmt_optional_float(latest_sar_px)} close={fmt_optional_float(latest_sar_close_px)}. "
+                                "Canceling reduce-only orders and market-closing."
+                            )
+                            await cancel_reduce_only_orders_for_coin(
+                                info,
+                                exchange,
+                                account_address,
+                                coin,
+                                only_tpsl=False,
+                            )
+                            try:
+                                resp = await exchange.market_close(coin, slippage=market_slippage)
+                                print(f"[SL-SAR] market_close response: {resp}")
+                            except Exception as exc:
+                                print(f"[ERROR] Auto SAR market_close failed for {coin}: {exc}")
+                                continue
+                            return
                         if updated_sar_stop_px is not None:
                             rounded_sar_stop_px = await round_price_for_hyperliquid(info, coin, updated_sar_stop_px)
                             if hide_orders:
@@ -1363,39 +1410,6 @@ async def monitor_bracket_position(
                         account_address,
                         coin,
                     )
-                    if hybrid_trailing_tp_enabled and not hide_orders and not trailing_tp_armed:
-                        remaining_tp_count = len(open_tp_orders)
-                        if 0 < remaining_tp_count <= trailing_tp_remaining_levels:
-                            remaining_tp_oids = [
-                                int(order["oid"])
-                                for order in open_tp_orders
-                                if isinstance(order, dict) and isinstance(order.get("oid"), int)
-                            ]
-                            print(
-                                f"[TRAILING-TP] {coin} reached final TP ladder segment with "
-                                f"{remaining_tp_count} level(s) still open. Canceling those resting TP orders "
-                                "and switching the remainder to a local trailing TP."
-                            )
-                            await cancel_oids(
-                                exchange,
-                                coin,
-                                remaining_tp_oids,
-                                "final TP orders before trailing conversion",
-                            )
-                            await asyncio.sleep(min(max(poll_interval * 0.25, 0.15), 0.5))
-                            trailing_tp_armed = True
-                            trailing_tp_stop_px = compute_trailing_take_profit_stop_px(
-                                side=side,
-                                entry_px=entry_px,
-                                favorable_extreme=favorable_extreme,
-                                trail_profit_pct=trailing_tp_profit_pct,
-                                current_stop_px=trailing_tp_stop_px,
-                            )
-                            print(
-                                f"[TRAILING-TP] {coin} trailing TP armed after TP conversion; "
-                                f"initial stop={fmt_optional_float(trailing_tp_stop_px)}"
-                            )
-                            open_tp_orders = []
                     tp_levels_exhausted = False
                     if hide_orders:
                         tp_levels_exhausted = (
@@ -1499,8 +1513,6 @@ async def monitor_bracket_position(
                         if trailing_tp_armed
                         else f"trail-pending:L{trailing_tp_trigger_level}"
                     )
-                elif hybrid_trailing_tp_enabled:
-                    tp_targets_str = f"tp-ladder->trail:{trailing_tp_remaining_levels} remain"
                 else:
                     tp_targets_str = (
                         format_tp_targets(tp_orders, hidden_tp_placed_levels)
@@ -1736,7 +1748,6 @@ async def run_bracket_entry(
         tp_reversal_limit_exit: bool,
         tp_reversal_stop_buffer_pct: Optional[float],
         use_testnet: bool,
-        trailing_tp_remaining_levels: int = 0,
         use_websocket: bool = True,
         hide_orders: bool = False,
         auto_sar_stop_interval: Optional[str] = None,
@@ -1744,6 +1755,10 @@ async def run_bracket_entry(
         auto_sar_acceleration: Optional[float] = None,
         auto_sar_maximum: Optional[float] = None,
         auto_use_last_closed_candle: bool = True,
+        auto_use_websocket_candles: bool = False,
+        account_address: Optional[str] = None,
+        info: Optional[Info] = None,
+        exchange: Optional[Exchange] = None,
 ) -> None:
     """Enter a position and manage bracket protection/exit logic."""
     direction = direction.lower().strip()
@@ -1761,8 +1776,6 @@ async def run_bracket_entry(
         raise RuntimeError("--stop-loss-pct must be a decimal fraction between 0 and 1.")
     if take_profit_levels <= 0:
         raise RuntimeError("--take-profit-levels must be > 0.")
-    if trailing_tp_remaining_levels < 0:
-        raise RuntimeError("--trailing-tp-remaining-levels must be >= 0.")
     if trailing_tp_trigger_level <= 0:
         raise RuntimeError("--trailing-tp-trigger-level must be > 0.")
     if trailing_tp_trigger_level > take_profit_levels:
@@ -1774,10 +1787,12 @@ async def run_bracket_entry(
     if tp_tif not in ("Alo", "Gtc"):
         raise RuntimeError("--tp-tif must be Alo or Gtc.")
 
-    info: Optional[Info] = None
-    exchange: Optional[Exchange] = None
+    owns_clients = account_address is None and info is None and exchange is None
+    if not owns_clients and (account_address is None or info is None or exchange is None):
+        raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     try:
-        account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        if owns_clients:
+            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         metrics_start_time_ms = int(time.time() * 1000)
         coin = coin.upper()
         is_buy = direction == "long"
@@ -1788,6 +1803,7 @@ async def run_bracket_entry(
         print(f"Account:           {account_address}")
         print(f"Network:           {'TESTNET' if use_testnet else 'MAINNET'}")
         print(f"Websocket:         {'ENABLED' if use_websocket else 'DISABLED'}")
+        print(f"WS candles:        {'ENABLED' if auto_use_websocket_candles else 'DISABLED'}")
         print(f"Hide orders:       {hide_orders}")
         print(f"Coin:              {coin}")
         print(f"Direction:         {direction}")
@@ -1800,11 +1816,6 @@ async def run_bracket_entry(
         if use_trailing_tp:
             print(f"Trailing TP level: {trailing_tp_trigger_level}")
             print(f"Trailing TP pct:   {trailing_tp_profit_pct * 100:.4f}%")
-        elif trailing_tp_remaining_levels > 0:
-            print(
-                f"Trailing TP switch:{trailing_tp_remaining_levels} remaining TP level(s) -> "
-                f"trail {trailing_tp_profit_pct * 100:.4f}%"
-            )
         if stop_loss_pct is not None:
             print(f"Stop loss pct:     {stop_loss_pct * 100:.4f}%")
         else:
@@ -1886,7 +1897,6 @@ async def run_bracket_entry(
             hide_orders=hide_orders,
             use_trailing_tp=use_trailing_tp,
             trailing_tp_trigger_level=trailing_tp_trigger_level,
-            trailing_tp_remaining_levels=trailing_tp_remaining_levels,
             trailing_tp_profit_pct=trailing_tp_profit_pct,
             metrics_start_time_ms=metrics_start_time_ms,
             auto_sar_stop_interval=auto_sar_stop_interval,
@@ -1894,6 +1904,8 @@ async def run_bracket_entry(
             auto_sar_acceleration=auto_sar_acceleration,
             auto_sar_maximum=auto_sar_maximum,
             auto_use_last_closed_candle=auto_use_last_closed_candle,
+            auto_use_websocket_candles=auto_use_websocket_candles,
         )
     finally:
-        await close_clients(info, exchange)
+        if owns_clients:
+            await close_clients(info, exchange)

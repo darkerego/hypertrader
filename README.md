@@ -28,6 +28,12 @@ The canonical bot file in this repo is [`hypertrader.py`](/media/anon/developmen
 - Network access to Hyperliquid APIs
 - Account created with referral code [DARKEREGO](https://app.hyperliquid.xyz/join/DARKEREGO) (see account creation [*])
 
+Install from pip:
+
+<pre>
+pip install hypertrader[auto]
+</pre>
+
 Base dependencies:
 
 ```bash
@@ -230,8 +236,7 @@ Key options:
 - `--intervals`
 - `--auto-periods`
 - `--scan-interval`
-- `--scan-batch-size`
-- `--max-concurrency`
+- `--max-concurrent-scans`
 - `--min-agreement`
 - `--adx-threshold`
 - `--macd-fast`
@@ -239,18 +244,25 @@ Key options:
 - `--macd-signal`
 - `--sar-acceleration`
 - `--sar-maximum`
+- `--auto-sar-stop-on-shortest-interval`
 - `--adx-timeperiod`
 - `--bb-timeperiod`
 - `--bb-dev`
+- `--scalp`
 - `--use-live-candle`
 - `--take-profit-pct`: override Bollinger-derived TP
 - `--min-take-profit-pct`
 - `--max-take-profit-pct`
 - `--stop-loss-pct`
-- `--stop-loss-sar`
 - `--take-profit-levels`
+- `--trailing-tp`
+- `--trailing-tp-trigger-level`
+- `--trailing-tp-remaining-levels`
+- `--trailing-tp-profit-pct`
 - `--entry-retries`
 - `--entry-repost-interval`
+- `--entry-tif`
+- `--tp-tif`
 - `--poll-interval`
 - `--tp-reversal-pct`
 - `--tp-reversal-limit-exit`
@@ -263,11 +275,45 @@ Key options:
 - `--cooldown-after-trade`
 - `--loop-after-trade`
 - `--exit-after-trade`
+- `--max-coin-trades-per-session`
+- `--coin-session-cooldown-seconds`
+- `--coin-session-profit-target`
+- `--coin-session-min-profit-to-lock`
+- `--coin-session-giveback-pct`
+- `--cooldown-after-loss-following-wins`
+- `--session-profit-target`
+- `--session-max-loss`
+- `--session-giveback-pct`
+- `--risk-session-log`
+- `--ws-candles`
 - `--hide-orders` or `-ho`
 - `--testnet`
 - `--no-websocket`
 
 `auto` derives TP from Bollinger Bands unless `--take-profit-pct` overrides it. If TP is set and SL is omitted, SL defaults to half TP. Executions route through the same bracket-entry path used by `enter`.
+
+Additional `auto` parameter notes:
+
+- `--max-concurrent-scans`: limits how many markets are scanned in parallel in each auto loop.
+- `--auto-sar-stop-on-shortest-interval`: uses the Parabolic SAR from the shortest configured interval as the live stop trigger for auto-managed positions instead of the default pct-based stop behavior.
+- `--scalp`: requires additional shortest-interval Bollinger confirmation before entering.
+- `--max-coin-trades-per-session`: caps completed trade cycles per coin before that coin is cooled down.
+- `--coin-session-cooldown-seconds`: duration of the per-coin cooldown window after a coin-level stop condition triggers.
+- `--coin-session-profit-target`: pauses a coin after it reaches the configured realized PnL target for the current auto session.
+- `--coin-session-min-profit-to-lock`: enables per-coin giveback protection only after realized PnL first reaches this minimum lock threshold.
+- `--coin-session-giveback-pct`: pauses a coin after it gives back the configured fraction from its peak realized PnL.
+- `--cooldown-after-loss-following-wins`: pauses a coin after a losing trade that follows at least N consecutive winning cycles.
+- `--session-profit-target`: stops the entire auto session once total realized PnL reaches the target.
+- `--session-max-loss`: stops the entire auto session once total realized PnL falls to `-N` or below.
+- `--session-giveback-pct`: stops the entire auto session after giving back the configured fraction from peak realized PnL.
+- `--risk-session-log`: writes auto risk-session events to a JSONL file path you provide.
+- `--ws-candles`: experimental candle mode that seeds each `(coin, interval)` via `candleSnapshot`, then keeps them updated from websocket candle messages.
+
+Example with newer auto risk controls:
+
+```bash
+python3 hypertrader.py auto SOL --intervals "1m 5m 15m" --size 10 --dry-run --max-concurrent-scans 2 --coin-session-profit-target 25 --coin-session-giveback-pct 0.3 --session-max-loss 50
+```
 
 ### `market_maker`
 
@@ -294,7 +340,8 @@ Key options:
 
 ## Hidden Orders
 
-`--hide-orders` keeps TP/SL targets in memory instead of placing exchange-side bracket orders immediately.
+`--hide-orders` keeps TP/SL targets in memory instead of placing exchange-side bracket orders immediately. This prevents 
+exchange market maker bots from being able to see where your stops and take profit orders are.
 
 When enabled:
 

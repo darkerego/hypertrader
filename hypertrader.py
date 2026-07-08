@@ -17,7 +17,6 @@ Websocket market data is enabled by default; pass --no-websocket to force HTTP p
 """
 import argparse
 import asyncio
-import builtins
 import decimal
 import logging
 import os
@@ -34,6 +33,7 @@ from modes.position_watcher import run_position_watcher
 from modes.trailing_stop import trailing_stop_for_all_positions
 from utils.constants import DEFAULT_LOG_FILE, INTERVAL_TO_MS
 from utils.helpers import parse_fractional_pct
+from utils.style import install_pretty_stdout
 
 try:
     import numpy as np
@@ -48,6 +48,7 @@ except FileExistsError:
     pass
 
 decimal.getcontext().prec = 4
+install_pretty_stdout()
 
 
 def configure_runtime_logging(log_path: Optional[str] = None) -> str:
@@ -95,11 +96,6 @@ def install_asyncio_exception_logging(loop: asyncio.AbstractEventLoop) -> None:
         logger.error("[ASYNCIO] %s | context=%r", message, context)
 
     loop.set_exception_handler(_handle_asyncio_exception)
-
-
-def print(*values: Any, sep: str = " ", end: str = "\n", file: Any = None, flush: bool = False) -> None:
-    """Preserve console output for normal runtime status messages."""
-    builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +177,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                               help="Place the TP ladder, then after the configured TP level fills cancel the remaining ladder and switch to a local trailing take-profit.")
     enter_parser.add_argument("--trailing-tp-trigger-level", type=int, default=1,
                               help="TP ladder level that must fill before trailing TP activates. Default: 1.")
-    enter_parser.add_argument("--trailing-tp-remaining-levels", type=int, default=0,
-                              help="When this many TP ladder levels remain open, cancel them and switch the remainder to a local trailing TP. Default keeps the existing TP ladder behavior.")
     enter_parser.add_argument("--trailing-tp-profit-pct", type=float, default=0.25,
                               help="Trailing distance as a fraction of favorable unrealized profit after the first TP level is hit. Default: 0.25.")
     enter_parser.add_argument("--entry-retries", type=int, default=5,
@@ -229,8 +223,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                               help="Place the TP ladder, then after the configured TP level fills cancel the remaining ladder and switch to a local trailing take-profit.")
     watch_parser.add_argument("--trailing-tp-trigger-level", type=int, default=1,
                               help="TP ladder level that must fill before trailing TP activates. Default: 1.")
-    watch_parser.add_argument("--trailing-tp-remaining-levels", type=int, default=0,
-                              help="When this many TP ladder levels remain open, cancel them and switch the remainder to a local trailing TP. Default keeps the existing TP ladder behavior.")
     watch_parser.add_argument("--trailing-tp-profit-pct", type=float, default=0.25,
                               help="Trailing distance as a fraction of favorable unrealized profit after the first TP level is hit. Default: 0.25.")
     watch_parser.add_argument("--poll-interval", type=float, default=1.0,
@@ -310,8 +302,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Place the TP ladder, then after the configured TP level fills cancel the remaining ladder and switch to a local trailing take-profit.")
     auto_parser.add_argument("--trailing-tp-trigger-level", type=int, default=1,
                              help="TP ladder level that must fill before trailing TP activates. Default: 1.")
-    auto_parser.add_argument("--trailing-tp-remaining-levels", type=int, default=1,
-                             help="When this many TP ladder levels remain open, cancel them and switch the remainder to a local trailing TP. Default: 1.")
     auto_parser.add_argument("--trailing-tp-profit-pct", type=float, default=0.25,
                              help="Trailing distance as a fraction of favorable unrealized profit after the first TP level is hit. Default: 0.25.")
     auto_parser.add_argument("--entry-retries", type=int, default=5,
@@ -346,9 +336,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument("--exit-after-trade", dest="loop_after_trade", action="store_false",
                              help="Exit auto mode after the first completed managed trade.")
     auto_parser.set_defaults(loop_after_trade=True)
+    auto_parser.add_argument("--max-coin-trades-per-session", type=int, default=0,
+                             help="Per-coin completed trade-cycle limit before cooldown. 0 disables. Default: 0.")
+    auto_parser.add_argument("--coin-session-cooldown-seconds", type=float, default=0.0,
+                             help="Cooldown duration after a per-coin stop condition triggers. 0 disables timed cooldown. Default: 0.")
+    auto_parser.add_argument("--coin-session-profit-target", type=float, default=0.0,
+                             help="Per-coin realized PnL target before cooldown. 0 disables. Default: 0.")
+    auto_parser.add_argument("--coin-session-min-profit-to-lock", type=float, default=0.0,
+                             help="Minimum per-coin peak realized PnL before giveback protection activates. Default: 0.")
+    auto_parser.add_argument("--coin-session-giveback-pct", type=float, default=0.0,
+                             help="Per-coin giveback fraction from peak realized PnL before cooldown. 0 disables. Default: 0.")
+    auto_parser.add_argument("--cooldown-after-loss-following-wins", type=int, default=0,
+                             help="Cooldown a coin after a loss that follows at least N consecutive winning cycles. 0 disables. Default: 0.")
+    auto_parser.add_argument("--session-profit-target", type=float, default=0.0,
+                             help="Stop the entire auto session after total realized PnL reaches this target. 0 disables. Default: 0.")
+    auto_parser.add_argument("--session-max-loss", type=float, default=0.0,
+                             help="Stop the entire auto session if total realized PnL falls to -N or below. 0 disables. Default: 0.")
+    auto_parser.add_argument("--session-giveback-pct", type=float, default=0.0,
+                             help="Stop the entire auto session after giving back this fraction from peak realized PnL. 0 disables. Default: 0.")
+    auto_parser.add_argument("--risk-session-log", type=str, default="",
+                             help="Optional JSONL path for auto risk-session events.")
     auto_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
     auto_parser.add_argument("--no-websocket", action="store_true",
                              help="Disable websocket market-data cache and use HTTP polling only.")
+    auto_parser.add_argument("--disable-ws-candles", action="store_true",
+                             help="Disable ws for kline data (not recommended): ")
     auto_parser.add_argument("--hide-orders", "-ho", action="store_true",
                              help="Keep auto-mode TP/SL targets private; no exchange-side bracket orders are placed until targets trigger.")
 
@@ -408,9 +420,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         if args.take_profit_levels <= 0:
             print("[ERROR] --take-profit-levels must be > 0.")
             sys.exit(1)
-        if args.trailing_tp_remaining_levels < 0:
-            print("[ERROR] --trailing-tp-remaining-levels must be >= 0.")
-            sys.exit(1)
         if args.trailing_tp_trigger_level <= 0:
             print("[ERROR] --trailing-tp-trigger-level must be > 0.")
             sys.exit(1)
@@ -459,7 +468,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             tp_reversal_limit_exit=args.tp_reversal_limit_exit,
             tp_reversal_stop_buffer_pct=args.tp_reversal_stop_buffer_pct,
             use_testnet=args.testnet,
-            trailing_tp_remaining_levels=args.trailing_tp_remaining_levels,
             use_websocket=(not args.no_websocket),
             hide_orders=args.hide_orders,
         )
@@ -471,9 +479,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             sys.exit(1)
         if args.take_profit_levels <= 0:
             print("[ERROR] --take-profit-levels must be > 0.")
-            sys.exit(1)
-        if args.trailing_tp_remaining_levels < 0:
-            print("[ERROR] --trailing-tp-remaining-levels must be >= 0.")
             sys.exit(1)
         if args.trailing_tp_trigger_level <= 0:
             print("[ERROR] --trailing-tp-trigger-level must be > 0.")
@@ -501,7 +506,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             take_profit_levels=args.take_profit_levels,
             use_trailing_tp=args.trailing_tp,
             trailing_tp_trigger_level=args.trailing_tp_trigger_level,
-            trailing_tp_remaining_levels=args.trailing_tp_remaining_levels,
             trailing_tp_profit_pct=args.trailing_tp_profit_pct,
             poll_interval=args.poll_interval,
             tp_reversal_pct=args.tp_reversal_pct,
@@ -527,6 +531,12 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             except RuntimeError as exc:
                 print(f"[ERROR] {exc}")
                 sys.exit(1)
+
+        if args.disable_ws_candles:
+            setattr(args, 'ws_candles', False)
+        else:
+            setattr(args, 'ws_candles', True)
+
         if args.top_markets <= 0:
             print("[ERROR] --top-markets must be > 0.")
             sys.exit(1)
@@ -544,9 +554,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             sys.exit(1)
         if args.take_profit_levels <= 0:
             print("[ERROR] --take-profit-levels must be > 0.")
-            sys.exit(1)
-        if args.trailing_tp_remaining_levels < 0:
-            print("[ERROR] --trailing-tp-remaining-levels must be >= 0.")
             sys.exit(1)
         if args.trailing_tp_trigger_level <= 0:
             print("[ERROR] --trailing-tp-trigger-level must be > 0.")
@@ -575,8 +582,38 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         if args.cooldown_after_trade < 0.0:
             print("[ERROR] --cooldown-after-trade must be >= 0.")
             sys.exit(1)
+        if args.max_coin_trades_per_session < 0:
+            print("[ERROR] --max-coin-trades-per-session must be >= 0.")
+            sys.exit(1)
+        if args.coin_session_cooldown_seconds < 0.0:
+            print("[ERROR] --coin-session-cooldown-seconds must be >= 0.")
+            sys.exit(1)
+        if args.coin_session_profit_target < 0.0:
+            print("[ERROR] --coin-session-profit-target must be >= 0.")
+            sys.exit(1)
+        if args.coin_session_min_profit_to_lock < 0.0:
+            print("[ERROR] --coin-session-min-profit-to-lock must be >= 0.")
+            sys.exit(1)
+        if not (0.0 <= args.coin_session_giveback_pct < 1.0):
+            print("[ERROR] --coin-session-giveback-pct must be >= 0 and < 1.")
+            sys.exit(1)
+        if args.cooldown_after_loss_following_wins < 0:
+            print("[ERROR] --cooldown-after-loss-following-wins must be >= 0.")
+            sys.exit(1)
+        if args.session_profit_target < 0.0:
+            print("[ERROR] --session-profit-target must be >= 0.")
+            sys.exit(1)
+        if args.session_max_loss < 0.0:
+            print("[ERROR] --session-max-loss must be >= 0.")
+            sys.exit(1)
+        if not (0.0 <= args.session_giveback_pct < 1.0):
+            print("[ERROR] --session-giveback-pct must be >= 0 and < 1.")
+            sys.exit(1)
         if args.tp_reversal_stop_buffer_pct is not None and not (0.0 < args.tp_reversal_stop_buffer_pct < 1.0):
             print("[ERROR] --tp-reversal-stop-buffer-pct must be between 0 and 1.")
+            sys.exit(1)
+        if args.ws_candles and args.no_websocket:
+            print("[ERROR] --ws-candles requires websocket market data; remove --no-websocket.")
             sys.exit(1)
 
         await run_auto_trader(
@@ -597,7 +634,6 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             take_profit_levels=args.take_profit_levels,
             use_trailing_tp=args.trailing_tp,
             trailing_tp_trigger_level=args.trailing_tp_trigger_level,
-            trailing_tp_remaining_levels=args.trailing_tp_remaining_levels,
             trailing_tp_profit_pct=args.trailing_tp_profit_pct,
             entry_retries=args.entry_retries,
             entry_repost_interval=args.entry_repost_interval,
@@ -625,9 +661,20 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             max_trades=args.max_trades,
             cooldown_after_trade=args.cooldown_after_trade,
             loop_after_trade=args.loop_after_trade,
+            max_coin_trades_per_session=args.max_coin_trades_per_session,
+            coin_session_cooldown_seconds=args.coin_session_cooldown_seconds,
+            coin_session_profit_target=args.coin_session_profit_target,
+            coin_session_min_profit_to_lock=args.coin_session_min_profit_to_lock,
+            coin_session_giveback_pct=args.coin_session_giveback_pct,
+            cooldown_after_loss_following_wins=args.cooldown_after_loss_following_wins,
+            session_profit_target=args.session_profit_target,
+            session_max_loss=args.session_max_loss,
+            session_giveback_pct=args.session_giveback_pct,
             use_testnet=args.testnet,
             use_websocket=(not args.no_websocket),
+            use_websocket_candles=args.ws_candles,
             hide_orders=args.hide_orders,
+            risk_session_log=args.risk_session_log,
         )
         return
 

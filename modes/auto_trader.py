@@ -1,5 +1,6 @@
 import asyncio
 import decimal
+import json
 import logging
 import math
 import os
@@ -144,6 +145,33 @@ class BollingerState:
 
 
 @dataclass
+class CoinTradeSessionState:
+    coin: str
+    realized_pnl: float = 0.0
+    peak_pnl: float = 0.0
+    completed_cycles: int = 0
+    winning_cycles: int = 0
+    losing_cycles: int = 0
+    consecutive_wins: int = 0
+    consecutive_losses: int = 0
+    cooldown_until_ms: int = 0
+    cooldown_reason: str = ""
+    last_cycle_pnl: float = 0.0
+    last_cycle_started_ms: int = 0
+    last_cycle_closed_ms: int = 0
+
+
+@dataclass
+class AutoRiskSessionState:
+    started_ms: int
+    realized_pnl: float = 0.0
+    peak_pnl: float = 0.0
+    completed_cycles: int = 0
+    stopped: bool = False
+    stop_reason: str = ""
+
+
+@dataclass
 class AutoScanLoopSnapshot:
     """Per-scan shared state reused across all market candidates."""
     mids: Dict[str, float]
@@ -159,6 +187,272 @@ class AutoScanCandidate:
     decision: Optional["AutoTradeDecision"]
     existing_position: Optional[Dict[str, Any]]
     rejection_reason: Optional[str] = None
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def get_or_create_coin_session(
+    coin_sessions: Dict[str, CoinTradeSessionState],
+    coin: str,
+) -> CoinTradeSessionState:
+    coin_key = str(coin).upper()
+    existing = coin_sessions.get(coin_key)
+    if existing is not None:
+        return existing
+    created = CoinTradeSessionState(coin=coin_key)
+    coin_sessions[coin_key] = created
+    return created
+
+
+def _append_risk_event_log(path: str, payload: Dict[str, Any]) -> None:
+    if not path:
+        return
+    resolved_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(resolved_path) or ".", exist_ok=True)
+    with open(resolved_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def reset_coin_session_after_cooldown_if_needed(
+    coin_state: CoinTradeSessionState,
+    current_time_ms: int,
+    risk_session_log: str = "",
+    session_pnl: Optional[float] = None,
+) -> bool:
+    if coin_state.cooldown_until_ms <= 0 or current_time_ms < coin_state.cooldown_until_ms:
+        return False
+
+    print(
+        f"[AUTO-RISK] {coin_state.coin} cooldown expired; resetting coin session state "
+        f'(previous_reason="{coin_state.cooldown_reason}")'
+    )
+    _append_risk_event_log(
+        risk_session_log,
+        {
+            "ts_ms": current_time_ms,
+            "event": "coin_cooldown_expired",
+            "coin": coin_state.coin,
+            "reason": coin_state.cooldown_reason,
+            "coin_pnl": coin_state.realized_pnl,
+            "session_pnl": session_pnl,
+        },
+    )
+    coin_state.realized_pnl = 0.0
+    coin_state.peak_pnl = 0.0
+    coin_state.completed_cycles = 0
+    coin_state.winning_cycles = 0
+    coin_state.losing_cycles = 0
+    coin_state.consecutive_wins = 0
+    coin_state.consecutive_losses = 0
+    coin_state.cooldown_until_ms = 0
+    coin_state.cooldown_reason = ""
+    coin_state.last_cycle_pnl = 0.0
+    coin_state.last_cycle_started_ms = 0
+    coin_state.last_cycle_closed_ms = 0
+    return True
+
+
+def coin_is_blocked_by_risk(
+    coin_state: CoinTradeSessionState,
+    current_time_ms: int,
+) -> Tuple[bool, str]:
+    if coin_state.cooldown_until_ms > current_time_ms:
+        remaining_seconds = (coin_state.cooldown_until_ms - current_time_ms) / 1000.0
+        return (
+            True,
+            f'cooldown active {remaining_seconds:.1f}s remaining reason="{coin_state.cooldown_reason}"',
+        )
+    return False, ""
+
+
+def set_coin_cooldown(
+    coin_state: CoinTradeSessionState,
+    cooldown_seconds: float,
+    reason: str,
+) -> None:
+    coin_state.cooldown_reason = reason
+    if cooldown_seconds > 0.0:
+        coin_state.cooldown_until_ms = now_ms() + int(cooldown_seconds * 1000)
+    else:
+        coin_state.cooldown_until_ms = now_ms()
+
+
+async def fetch_trade_cycle_net_pnl(
+    info: Info,
+    account_address: str,
+    coin: str,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> Tuple[float, List[Dict[str, Any]], str]:
+    request_start_ms = start_time_ms - 5000
+    request_end_ms = end_time_ms + 5000
+    fills: Any
+
+    try:
+        try:
+            fills = await info.user_fills_by_time(
+                account_address,
+                request_start_ms,
+                request_end_ms,
+                aggregate_by_time=False,
+            )
+        except TypeError:
+            fills = await info.post(
+                "/info",
+                {
+                    "type": "userFillsByTime",
+                    "user": account_address,
+                    "startTime": request_start_ms,
+                    "endTime": request_end_ms,
+                    "aggregateByTime": False,
+                },
+            )
+    except Exception as exc:
+        return 0.0, [], f"pnl_unavailable: {exc}"
+
+    if not isinstance(fills, list):
+        return 0.0, [], f"pnl_unavailable: unexpected fills response type {type(fills).__name__}"
+
+    coin_upper = str(coin).upper()
+    filtered_fills: List[Dict[str, Any]] = []
+    net_pnl = 0.0
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        if str(fill.get("coin", "")).upper() != coin_upper:
+            continue
+        fill_time_ms = int(_try_float(fill.get("time")) or _try_float(fill.get("timestamp")) or 0.0)
+        if fill_time_ms < request_start_ms or fill_time_ms > request_end_ms:
+            continue
+        closed_pnl = _try_float(fill.get("closedPnl"))
+        if closed_pnl is None:
+            closed_pnl = _try_float(fill.get("closedPnL"))
+        if closed_pnl is None:
+            closed_pnl = _try_float(fill.get("realizedPnl"))
+        if closed_pnl is None:
+            closed_pnl = _try_float(fill.get("realizedPnL"))
+        if closed_pnl is None:
+            closed_pnl = _try_float(fill.get("realized_pnl"))
+        fee = _try_float(fill.get("fee")) or 0.0
+        net_pnl += (closed_pnl or 0.0) - fee
+        filtered_fills.append(fill)
+
+    if not filtered_fills:
+        return 0.0, [], "pnl_unavailable: no matching fills in trade cycle window"
+
+    return net_pnl, filtered_fills, ""
+
+
+def update_risk_after_trade_cycle(
+    coin_state: CoinTradeSessionState,
+    session_state: AutoRiskSessionState,
+    cycle_pnl: float,
+    cycle_started_ms: int,
+    cycle_closed_ms: int,
+    max_coin_trades_per_session: int,
+    coin_session_cooldown_seconds: float,
+    coin_session_profit_target: float,
+    coin_session_min_profit_to_lock: float,
+    coin_session_giveback_pct: float,
+    cooldown_after_loss_following_wins: int,
+    session_profit_target: float,
+    session_max_loss: float,
+    session_giveback_pct: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    previous_consecutive_wins = coin_state.consecutive_wins
+
+    coin_state.realized_pnl += cycle_pnl
+    coin_state.peak_pnl = max(coin_state.peak_pnl, coin_state.realized_pnl)
+    coin_state.completed_cycles += 1
+    coin_state.last_cycle_pnl = cycle_pnl
+    coin_state.last_cycle_started_ms = cycle_started_ms
+    coin_state.last_cycle_closed_ms = cycle_closed_ms
+
+    if cycle_pnl > 0.0:
+        coin_state.winning_cycles += 1
+        coin_state.consecutive_wins += 1
+        coin_state.consecutive_losses = 0
+    elif cycle_pnl < 0.0:
+        coin_state.losing_cycles += 1
+        coin_state.consecutive_losses += 1
+        coin_state.consecutive_wins = 0
+    else:
+        coin_state.consecutive_wins = 0
+        coin_state.consecutive_losses = 0
+
+    session_state.realized_pnl += cycle_pnl
+    session_state.peak_pnl = max(session_state.peak_pnl, session_state.realized_pnl)
+    session_state.completed_cycles += 1
+
+    coin_reason: Optional[str] = None
+    if 0 < max_coin_trades_per_session <= coin_state.completed_cycles:
+        coin_reason = (
+            "max_coin_trades_per_session reached: "
+            f"completed_cycles={coin_state.completed_cycles} limit={max_coin_trades_per_session}"
+        )
+    elif 0.0 < coin_session_profit_target <= coin_state.realized_pnl:
+        coin_reason = (
+            "coin profit target reached: "
+            f"pnl={coin_state.realized_pnl:.6f} target={coin_session_profit_target:.6f}"
+        )
+    elif (
+            0 < cooldown_after_loss_following_wins <= previous_consecutive_wins
+            and cycle_pnl < 0.0
+    ):
+        coin_reason = (
+            "loss after win streak: "
+            f"previous_wins={previous_consecutive_wins} loss={cycle_pnl:.6f}"
+        )
+    elif (
+        coin_session_giveback_pct > 0.0
+        and coin_state.peak_pnl > 0.0
+        and coin_state.peak_pnl >= coin_session_min_profit_to_lock
+    ):
+        threshold = coin_state.peak_pnl * (1.0 - coin_session_giveback_pct)
+        if coin_state.realized_pnl <= threshold:
+            coin_reason = (
+                "coin giveback stop: "
+                f"pnl={coin_state.realized_pnl:.6f} peak={coin_state.peak_pnl:.6f} "
+                f"giveback_pct={coin_session_giveback_pct:.6f} threshold={threshold:.6f}"
+            )
+
+    if coin_reason is not None:
+        set_coin_cooldown(
+            coin_state=coin_state,
+            cooldown_seconds=coin_session_cooldown_seconds,
+            reason=coin_reason,
+        )
+
+    session_reason: Optional[str] = None
+    if session_max_loss > 0.0 and session_state.realized_pnl <= -abs(session_max_loss):
+        session_reason = (
+            "session max loss reached "
+            f"pnl={session_state.realized_pnl:.6f} limit=-{abs(session_max_loss):.6f}"
+        )
+    elif 0.0 < session_profit_target <= session_state.realized_pnl:
+        session_reason = (
+            "session profit target reached "
+            f"pnl={session_state.realized_pnl:.6f} target={session_profit_target:.6f}"
+        )
+    elif (
+        session_giveback_pct > 0.0
+        and session_state.peak_pnl > 0.0
+    ):
+        threshold = session_state.peak_pnl * (1.0 - session_giveback_pct)
+        if session_state.realized_pnl <= threshold:
+            session_reason = (
+                "session giveback stop "
+                f"pnl={session_state.realized_pnl:.6f} peak={session_state.peak_pnl:.6f} "
+                f"giveback_pct={session_giveback_pct:.6f} threshold={threshold:.6f}"
+            )
+
+    if session_reason is not None:
+        session_state.stopped = True
+        session_state.stop_reason = session_reason
+
+    return coin_reason, session_reason
 
 def _normalize_state_key(key: Any) -> str:
     """Normalize account-state keys so minor API casing/name shifts still match."""
@@ -926,6 +1220,7 @@ async def compute_auto_interval_signal(
     bb_timeperiod: int,
     bb_dev: float,
     use_last_closed_candle: bool,
+    use_websocket_candles: bool = False,
 ) -> AutoIntervalSignal:
     """Fetch candles for one interval and compute MACD/SAR/ADX/Bollinger signal state."""
     require_talib_available()
@@ -934,7 +1229,13 @@ async def compute_auto_interval_signal(
         raise RuntimeError(f"--auto-periods must be at least {minimum_periods} for the chosen indicator settings.")
     # TODO: Determine - is it possible to retrieve candles for multiple coins with one API call? Or is this data \
     # TODO: that is available over the websocket?
-    candles = await fetch_recent_candles(info, coin, interval, periods)
+    candles = await fetch_recent_candles(
+        info,
+        coin,
+        interval,
+        periods,
+        use_websocket_candles=use_websocket_candles,
+    )
     usable_candles = candles[:-1] if use_last_closed_candle and len(candles) > 1 else candles
 
     highs: List[float] = []
@@ -1065,6 +1366,7 @@ async def evaluate_auto_trade_decision(
     bb_dev: float,
     use_last_closed_candle: bool,
     use_sar_stop_on_shortest_interval: bool,
+    use_websocket_candles: bool = False,
     current_px: Optional[float] = None,
 ) -> AutoTradeDecision:
     """Evaluate all configured intervals and return an aggregated trade decision."""
@@ -1088,6 +1390,7 @@ async def evaluate_auto_trade_decision(
                     bb_timeperiod=bb_timeperiod,
                     bb_dev=bb_dev,
                     use_last_closed_candle=use_last_closed_candle,
+                    use_websocket_candles=use_websocket_candles,
                 )
             )
         except Exception as exc:
@@ -1258,6 +1561,7 @@ async def scan_auto_trade_candidate(
     use_last_closed_candle: bool,
     use_sar_stop_on_shortest_interval: bool,
     snapshot: AutoScanLoopSnapshot,
+    use_websocket_candles: bool = False,
 ) -> AutoScanCandidate:
     """Scan one market using shared loop snapshots to avoid redundant REST calls."""
     existing_pos = snapshot.positions_by_coin.get(scan_coin.upper())
@@ -1285,6 +1589,7 @@ async def scan_auto_trade_candidate(
         bb_dev=bb_dev,
         use_last_closed_candle=use_last_closed_candle,
         use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
+        use_websocket_candles=use_websocket_candles,
         current_px=snapshot.mids.get(scan_coin.upper()),
     )
     print_auto_decision(decision, scan_coin)
@@ -1332,7 +1637,6 @@ async def run_auto_trader(
     take_profit_levels: int,
     use_trailing_tp: bool,
     trailing_tp_trigger_level: int,
-    trailing_tp_remaining_levels: int,
     trailing_tp_profit_pct: float,
     entry_retries: int,
     entry_repost_interval: float,
@@ -1360,9 +1664,23 @@ async def run_auto_trader(
     max_trades: int,
     cooldown_after_trade: float,
     loop_after_trade: bool,
+    max_coin_trades_per_session: int,
+    coin_session_cooldown_seconds: float,
+    coin_session_profit_target: float,
+    coin_session_min_profit_to_lock: float,
+    coin_session_giveback_pct: float,
+    cooldown_after_loss_following_wins: int,
+    session_profit_target: float,
+    session_max_loss: float,
+    session_giveback_pct: float,
     use_testnet: bool,
     use_websocket: bool = True,
+    use_websocket_candles: bool = False,
     hide_orders: bool = False,
+    risk_session_log: str = "",
+    account_address: Optional[str] = None,
+    info: Optional[Info] = None,
+    exchange: Optional[Exchange] = None,
 ) -> None:
     """Automatically scan TA-Lib signals, enter positions, and hand off to bracket management."""
 
@@ -1404,8 +1722,6 @@ async def run_auto_trader(
         raise RuntimeError("--trailing-tp-trigger-level must be > 0.")
     if trailing_tp_trigger_level > take_profit_levels:
         raise RuntimeError("--trailing-tp-trigger-level cannot exceed --take-profit-levels.")
-    if trailing_tp_remaining_levels < 0:
-        raise RuntimeError("--trailing-tp-remaining-levels must be >= 0.")
     if not (0.0 < trailing_tp_profit_pct < 1.0):
         raise RuntimeError("--trailing-tp-profit-pct must be between 0 and 1.")
     if entry_retries < 0:
@@ -1418,21 +1734,46 @@ async def run_auto_trader(
         raise RuntimeError("--max-trades must be >= 0.")
     if cooldown_after_trade < 0.0:
         raise RuntimeError("--cooldown-after-trade must be >= 0.")
+    if max_coin_trades_per_session < 0:
+        raise RuntimeError("--max-coin-trades-per-session must be >= 0.")
+    if coin_session_cooldown_seconds < 0.0:
+        raise RuntimeError("--coin-session-cooldown-seconds must be >= 0.")
+    if coin_session_profit_target < 0.0:
+        raise RuntimeError("--coin-session-profit-target must be >= 0.")
+    if coin_session_min_profit_to_lock < 0.0:
+        raise RuntimeError("--coin-session-min-profit-to-lock must be >= 0.")
+    if not (0.0 <= coin_session_giveback_pct < 1.0):
+        raise RuntimeError("--coin-session-giveback-pct must be >= 0 and < 1.")
+    if cooldown_after_loss_following_wins < 0:
+        raise RuntimeError("--cooldown-after-loss-following-wins must be >= 0.")
+    if session_profit_target < 0.0:
+        raise RuntimeError("--session-profit-target must be >= 0.")
+    if session_max_loss < 0.0:
+        raise RuntimeError("--session-max-loss must be >= 0.")
+    if not (0.0 <= session_giveback_pct < 1.0):
+        raise RuntimeError("--session-giveback-pct must be >= 0 and < 1.")
+    if use_websocket_candles and not use_websocket:
+        raise RuntimeError("--ws-candles requires websocket market data. Remove --no-websocket to enable it.")
 
-    info: Optional[Info] = None
-    exchange: Optional[Exchange] = None
+    owns_clients = account_address is None and info is None and exchange is None
+    if not owns_clients and (account_address is None or info is None or exchange is None):
+        raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     completed_trades = 0
     auto_trades_logger = get_auto_trades_logger()
 
     try:
-        account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        if owns_clients:
+            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         metrics_start_time_ms = int(time.time() * 1000)
+        risk_session = AutoRiskSessionState(started_ms=metrics_start_time_ms)
+        coin_sessions: Dict[str, CoinTradeSessionState] = {}
         print("============================================================")
         print(" Hyperliquid Async Auto Trader")
         print("============================================================")
         print(f"Account:            {account_address}")
         print(f"Network:            {'TESTNET' if use_testnet else 'MAINNET'}")
         print(f"Websocket:          {'ENABLED' if use_websocket else 'DISABLED'}")
+        print(f"WS candles:         {'ENABLED' if use_websocket_candles else 'DISABLED'}")
         print(f"Hide orders:        {hide_orders}")
         print(f"Coin scope:         {coin if coin is not None else f'TOP {top_markets} PERPS BY VOLUME'}")
         print(f"Size mode:          {'fixed contracts' if size is not None else 'available collateral pct'}")
@@ -1450,16 +1791,22 @@ async def run_auto_trader(
         if use_trailing_tp:
             print(f"Trailing TP level:  {trailing_tp_trigger_level}")
             print(f"Trailing TP pct:    {trailing_tp_profit_pct * 100:.4f}% of favorable unrealized profit")
-        elif trailing_tp_remaining_levels > 0:
-            print(
-                f"Trailing TP switch: when {trailing_tp_remaining_levels} TP level(s) remain open, "
-                "cancel them and trail the remainder"
-            )
         print(f"Scan interval:      {scan_interval:.2f}s")
         print(f"Scan concurrency:   {max_concurrent_scans}")
         print(f"Dry run:            {dry_run}")
         print(f"Max trades:         {'unlimited' if max_trades == 0 else max_trades}")
         print(f"Loop after trade:   {loop_after_trade}")
+        print("Coin risk controls:")
+        print(f"  max_coin_trades_per_session={max_coin_trades_per_session}")
+        print(f"  coin_session_cooldown_seconds={coin_session_cooldown_seconds}")
+        print(f"  coin_session_profit_target={coin_session_profit_target}")
+        print(f"  coin_session_min_profit_to_lock={coin_session_min_profit_to_lock}")
+        print(f"  coin_session_giveback_pct={coin_session_giveback_pct}")
+        print(f"  cooldown_after_loss_following_wins={cooldown_after_loss_following_wins}")
+        print("Session risk controls:")
+        print(f"  session_profit_target={session_profit_target}")
+        print(f"  session_max_loss={session_max_loss}")
+        print(f"  session_giveback_pct={session_giveback_pct}")
         print("============================================================")
 
         while True:
@@ -1479,6 +1826,39 @@ async def run_auto_trader(
                     await asyncio.sleep(scan_interval)
                     continue
 
+            eligible_scan_coins: List[str] = []
+            current_time_ms = now_ms()
+            for scan_coin in scan_coins:
+                coin_state = get_or_create_coin_session(coin_sessions, scan_coin)
+                reset_coin_session_after_cooldown_if_needed(
+                    coin_state,
+                    current_time_ms,
+                    risk_session_log=risk_session_log,
+                    session_pnl=risk_session.realized_pnl,
+                )
+                is_blocked, block_reason = coin_is_blocked_by_risk(coin_state, current_time_ms)
+                if is_blocked:
+                    print(f"[AUTO-RISK] Skipping {scan_coin}: {block_reason}")
+                    _append_risk_event_log(
+                        risk_session_log,
+                        {
+                            "ts_ms": current_time_ms,
+                            "event": "coin_skipped",
+                            "coin": coin_state.coin,
+                            "reason": coin_state.cooldown_reason,
+                            "blocked_detail": block_reason,
+                            "coin_pnl": coin_state.realized_pnl,
+                            "session_pnl": risk_session.realized_pnl,
+                        },
+                    )
+                    continue
+                eligible_scan_coins.append(scan_coin)
+
+            if not eligible_scan_coins:
+                print("[AUTO-RISK] All scan candidates are blocked by coin session controls.")
+                await asyncio.sleep(scan_interval)
+                continue
+
             shared_snapshot = await build_auto_scan_loop_snapshot(
                 info=info,
                 account_address=account_address,
@@ -1488,7 +1868,7 @@ async def run_auto_trader(
             selected_decision: Optional[AutoTradeDecision] = None
             selected_size: Optional[float] = None
 
-            scan_concurrency = min(max_concurrent_scans, max(1, len(scan_coins)))
+            scan_concurrency = min(max_concurrent_scans, max(1, len(eligible_scan_coins)))
             scan_semaphore = asyncio.Semaphore(scan_concurrency)
 
             async def _scan_with_limit(scan_coin: str) -> AutoScanCandidate:
@@ -1516,9 +1896,10 @@ async def run_auto_trader(
                         use_last_closed_candle=use_last_closed_candle,
                         use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
                         snapshot=shared_snapshot,
+                        use_websocket_candles=use_websocket_candles,
                     )
 
-            scan_tasks = [asyncio.create_task(_scan_with_limit(scan_coin)) for scan_coin in scan_coins]
+            scan_tasks = [asyncio.create_task(_scan_with_limit(scan_coin)) for scan_coin in eligible_scan_coins]
             try:
                 for completed_task in asyncio.as_completed(scan_tasks):
                     try:
@@ -1569,6 +1950,7 @@ async def run_auto_trader(
             await asyncio.gather(*scan_tasks, return_exceptions=True)
 
             if selected_coin is None or selected_decision is None or selected_size is None:
+                print('=' * 40 + f'Sleeping {scan_interval} seconds .. ' + '=' * 40)
                 await asyncio.sleep(scan_interval)
                 continue
 
@@ -1580,7 +1962,9 @@ async def run_auto_trader(
             direction = selected_decision.direction
             auto_tp_pct = selected_decision.take_profit_pct
             auto_sl_pct = stop_loss_pct if stop_loss_pct is not None else selected_decision.stop_loss_pct
-            auto_sl_trigger_px = selected_decision.stop_loss_trigger_px if use_sar_stop_on_shortest_interval else None
+            auto_sl_trigger_px = None
+            if use_sar_stop_on_shortest_interval:
+                auto_sl_trigger_px = selected_decision.stop_loss_trigger_px
             shortest_snapshot = get_shortest_interval_snapshot(selected_decision.snapshots)
             sl_display = f"{auto_sl_pct * 100:.4f}%" if auto_sl_pct is not None else "N/A"
             print(
@@ -1589,10 +1973,7 @@ async def run_auto_trader(
                 f"sl_trigger={f'{auto_sl_trigger_px:.8f}' if auto_sl_trigger_px is not None else 'N/A'}"
             )
 
-            await close_clients(info, exchange)
-            info = None
-            exchange = None
-
+            trade_cycle_started_ms = now_ms()
             await run_bracket_entry(
                 coin=selected_coin,
                 direction=direction,
@@ -1603,7 +1984,6 @@ async def run_auto_trader(
                 take_profit_levels=take_profit_levels,
                 use_trailing_tp=use_trailing_tp,
                 trailing_tp_trigger_level=trailing_tp_trigger_level,
-                trailing_tp_remaining_levels=trailing_tp_remaining_levels,
                 trailing_tp_profit_pct=trailing_tp_profit_pct,
                 entry_retries=entry_retries,
                 entry_repost_interval=entry_repost_interval,
@@ -1628,7 +2008,12 @@ async def run_auto_trader(
                 auto_sar_acceleration=sar_acceleration if use_sar_stop_on_shortest_interval else None,
                 auto_sar_maximum=sar_maximum if use_sar_stop_on_shortest_interval else None,
                 auto_use_last_closed_candle=use_last_closed_candle,
+                auto_use_websocket_candles=use_websocket_candles,
+                account_address=account_address,
+                info=info,
+                exchange=exchange,
             )
+            trade_cycle_closed_ms = now_ms()
             completed_trades += 1
             auto_trades_logger.info(
                 "[AUTO-TRADE-COMPLETE] coin=%s direction=%s size=%.8f tp_pct=%.8f sl_pct=%s completed_trades=%d",
@@ -1639,6 +2024,102 @@ async def run_auto_trader(
                 f"{auto_sl_pct:.8f}" if auto_sl_pct is not None else "N/A",
                 completed_trades,
             )
+
+            if info is None or exchange is None:
+                account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+
+            cycle_pnl, cycle_fills, pnl_reason = await fetch_trade_cycle_net_pnl(
+                info=info,
+                account_address=account_address,
+                coin=selected_coin,
+                start_time_ms=trade_cycle_started_ms,
+                end_time_ms=trade_cycle_closed_ms,
+            )
+            if pnl_reason:
+                print(
+                    f"[AUTO-WARN] {selected_coin} post-trade PnL unavailable; "
+                    f"risk session not updated for this cycle: {pnl_reason}"
+                )
+                _append_risk_event_log(
+                    risk_session_log,
+                    {
+                        "ts_ms": trade_cycle_closed_ms,
+                        "event": "cycle_pnl_unavailable",
+                        "coin": selected_coin,
+                        "reason": pnl_reason,
+                        "session_pnl": risk_session.realized_pnl,
+                    },
+                )
+            else:
+                coin_state = get_or_create_coin_session(coin_sessions, selected_coin)
+                coin_reason, session_reason = update_risk_after_trade_cycle(
+                    coin_state=coin_state,
+                    session_state=risk_session,
+                    cycle_pnl=cycle_pnl,
+                    cycle_started_ms=trade_cycle_started_ms,
+                    cycle_closed_ms=trade_cycle_closed_ms,
+                    max_coin_trades_per_session=max_coin_trades_per_session,
+                    coin_session_cooldown_seconds=coin_session_cooldown_seconds,
+                    coin_session_profit_target=coin_session_profit_target,
+                    coin_session_min_profit_to_lock=coin_session_min_profit_to_lock,
+                    coin_session_giveback_pct=coin_session_giveback_pct,
+                    cooldown_after_loss_following_wins=cooldown_after_loss_following_wins,
+                    session_profit_target=session_profit_target,
+                    session_max_loss=session_max_loss,
+                    session_giveback_pct=session_giveback_pct,
+                )
+                print(
+                    f"[AUTO-RISK] {selected_coin} cycle_pnl={cycle_pnl:.6f} "
+                    f"coin_pnl={coin_state.realized_pnl:.6f} coin_peak={coin_state.peak_pnl:.6f} "
+                    f"coin_cycles={coin_state.completed_cycles} session_pnl={risk_session.realized_pnl:.6f} "
+                    f"session_peak={risk_session.peak_pnl:.6f}"
+                )
+                _append_risk_event_log(
+                    risk_session_log,
+                    {
+                        "ts_ms": trade_cycle_closed_ms,
+                        "event": "cycle_complete",
+                        "coin": selected_coin,
+                        "cycle_pnl": cycle_pnl,
+                        "coin_pnl": coin_state.realized_pnl,
+                        "coin_peak_pnl": coin_state.peak_pnl,
+                        "coin_cycles": coin_state.completed_cycles,
+                        "session_pnl": risk_session.realized_pnl,
+                        "session_peak_pnl": risk_session.peak_pnl,
+                        "fills_count": len(cycle_fills),
+                    },
+                )
+                if coin_reason is not None:
+                    print(
+                        f"[AUTO-RISK] {selected_coin} entering cooldown for "
+                        f"{coin_session_cooldown_seconds:.1f}s reason=\"{coin_reason}\""
+                    )
+                    _append_risk_event_log(
+                        risk_session_log,
+                        {
+                            "ts_ms": trade_cycle_closed_ms,
+                            "event": "coin_cooldown",
+                            "coin": selected_coin,
+                            "reason": coin_reason,
+                            "coin_pnl": coin_state.realized_pnl,
+                            "session_pnl": risk_session.realized_pnl,
+                        },
+                    )
+                if session_reason is not None:
+                    print(f"[AUTO-RISK] Session stop triggered: {session_reason}")
+                    _append_risk_event_log(
+                        risk_session_log,
+                        {
+                            "ts_ms": trade_cycle_closed_ms,
+                            "event": "session_stop",
+                            "coin": selected_coin,
+                            "reason": session_reason,
+                            "coin_pnl": coin_state.realized_pnl,
+                            "session_pnl": risk_session.realized_pnl,
+                        },
+                    )
+                if risk_session.stopped:
+                    return
 
             if 0 < max_trades <= completed_trades:
                 print(f"[AUTO] Completed {completed_trades} trade(s); exiting auto mode.")
@@ -1652,9 +2133,9 @@ async def run_auto_trader(
                 print(f"[AUTO] Cooling down for {cooldown_after_trade:.2f}s before resuming scans.")
                 await asyncio.sleep(cooldown_after_trade)
 
-            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
             metrics_start_time_ms = int(time.time() * 1000)
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, stopping auto trader.")
     finally:
-        await close_clients(info, exchange)
+        if owns_clients:
+            await close_clients(info, exchange)

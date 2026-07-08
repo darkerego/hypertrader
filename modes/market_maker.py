@@ -179,6 +179,9 @@ async def run_market_maker(
     rebalance_threshold_pct: float,
     protect_close_pct: float,
     use_websocket: bool = True,
+    account_address: Optional[str] = None,
+    info: Optional[Info] = None,
+    exchange: Optional[Exchange] = None,
 ) -> None:
     """Market maker that only rebalances when price drifts away from current ladder."""
     if levels <= 0:
@@ -196,10 +199,12 @@ async def run_market_maker(
     if loop_sleep is None or loop_sleep <= 0.0:
         loop_sleep = 1.0
 
-    info: Optional[Info] = None
-    exchange: Optional[Exchange] = None
+    owns_clients = account_address is None and info is None and exchange is None
+    if not owns_clients and (account_address is None or info is None or exchange is None):
+        raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     try:
-        account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        if owns_clients:
+            account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         coin = coin.upper()
 
         print("============================================================")
@@ -388,4 +393,5 @@ async def run_market_maker(
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, stopping market maker loop.")
     finally:
-        await close_clients(info, exchange)
+        if owns_clients:
+            await close_clients(info, exchange)
