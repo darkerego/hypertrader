@@ -1,3 +1,20 @@
+# 2026-07-08 01:48:23 EDT
+
+- Updated `modes/auto_trader.py` so `--cooldown-after-trade` is now tracked per coin instead of as a single global auto-scan pause, which lets other markets continue scanning and opening trades while only the just-closed market is cooling down.
+- Added per-coin post-trade cooldown filtering in the auto scan loop, preserving existing per-coin risk-session cooldown behavior while preventing concurrent positions on unrelated markets from being blocked by another market's close.
+
+# 2026-07-08 01:41:07 EDT
+
+- Updated `hypertrader.py` auto-mode CLI with `--max-positions`, defaulting to `3`, and validated that the new limit must be greater than zero before `run_auto_trader(...)` starts.
+- Reworked `modes/auto_trader.py` so auto entries launch `run_bracket_entry(...)` in background `asyncio.Task` instances, allowing the scanner to keep evaluating other markets while existing auto-managed positions are being entered and monitored.
+- Added active managed-trade tracking and slot reservation in auto mode so new entries are skipped once the combined set of live positions plus active auto tasks reaches `--max-positions`, while completed background trades still flow through the existing realized-PnL and risk-session accounting.
+- Validation: `python3 -m py_compile hypertrader.py` and `python3 -m py_compile modes/auto_trader.py` passed. CLI help checks are still blocked in this environment because `uvloop` is not installed (`ModuleNotFoundError: No module named 'uvloop'`).
+
+# 2026-07-08 01:09:41 EDT
+
+- Hardened `modes/position_management.py` residual TP close handling so when the auto-managed take-profit ladder is exhausted, the bot now cancels leftover reduce-only orders, rechecks the live position, and retries `exchange.market_close(...)` up to three times until the same-side remainder is flat.
+- Replaced the old single-shot TP remainder `market_close` path with explicit post-close verification and retry logging, which prevents partially closed auto trades from being left open after the limit TP ladder finishes.
+
 # 2026-07-07 21:00:00 EDT
 
 - Removed the remaining-level trailing-TP path from `hypertrader.py`, `modes/position_management.py`, `modes/position_watcher.py`, and `modes/auto_trader.py`; trailing take-profit now keeps only the trigger-level activation flow.

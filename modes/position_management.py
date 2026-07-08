@@ -602,6 +602,81 @@ async def exit_on_tp_reversal(
         return False
 
 
+async def close_position_remainder_with_market_retries(
+        info: Info,
+        exchange: Exchange,
+        account_address: str,
+        coin: str,
+        side: str,
+        market_slippage: float,
+        poll_interval: float,
+        label: str = "TP-REMAINDER",
+        max_attempts: int = 3,
+) -> bool:
+    """Repeatedly reconcile and market-close a residual same-side position until flat."""
+    settle_before_close = min(max(poll_interval * 0.25, 0.15), 0.5)
+    settle_after_close = min(max(poll_interval * 0.5, 0.25), 1.0)
+
+    for attempt in range(1, max_attempts + 1):
+        await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
+        await asyncio.sleep(settle_before_close)
+
+        remainder_pos = await get_position_for_coin(info, account_address, coin)
+        if remainder_pos is None:
+            print(f"[{label}] {coin} is already flat after cleanup.")
+            return True
+
+        try:
+            _, remainder_signed_size, _, remainder_side, remainder_abs = parse_position_snapshot(remainder_pos)
+        except RuntimeError as exc:
+            print(f"[{label}] {coin} remainder check could not parse live position: {exc}")
+            return False
+
+        if remainder_side != side or remainder_abs <= 0.0:
+            print(f"[{label}] {coin} no longer has a managed residual position.")
+            return True
+
+        print(
+            f"[{label}] attempt {attempt}/{max_attempts} closing residual {coin} position: "
+            f"signed={remainder_signed_size:.8f} abs={remainder_abs:.8f}"
+        )
+        try:
+            resp = await exchange.market_close(coin, slippage=market_slippage)
+            print(f"[{label}] market_close response: {resp}")
+        except Exception as exc:
+            print(f"[ERROR] {label} market_close failed for {coin} on attempt {attempt}/{max_attempts}: {exc}")
+            if attempt >= max_attempts:
+                return False
+            await asyncio.sleep(settle_after_close)
+            continue
+
+        await asyncio.sleep(settle_after_close)
+        final_remainder_pos = await get_position_for_coin(info, account_address, coin)
+        if final_remainder_pos is None:
+            print(f"[{label}] {coin} fully closed after residual market exit.")
+            return True
+
+        try:
+            _, final_signed_size, _, final_side, final_abs = parse_position_snapshot(final_remainder_pos)
+        except RuntimeError as exc:
+            print(f"[{label}-WARN] {coin} post-close position parse failed: {exc}")
+            if attempt >= max_attempts:
+                return False
+            continue
+
+        if final_side != side or final_abs <= 0.0:
+            print(f"[{label}] {coin} no longer has a managed residual position after market exit.")
+            return True
+
+        print(
+            f"[{label}-WARN] {coin} still open after attempt {attempt}/{max_attempts}: "
+            f"signed={final_signed_size:.8f} abs={final_abs:.8f}. Retrying cleanup."
+        )
+
+    print(f"[{label}-WARN] {coin} residual position remained open after {max_attempts} market-close attempts.")
+    return False
+
+
 async def place_hidden_take_profit_order(
         info: Info,
         exchange: Exchange,
@@ -1425,42 +1500,18 @@ async def monitor_bracket_position(
                             f"[TP-REMAINDER] {coin} take-profit ladder is exhausted; "
                             "checking whether any position remains open."
                         )
-                        await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
-                        await asyncio.sleep(min(max(poll_interval * 0.25, 0.15), 0.5))
-                        remainder_pos = await get_position_for_coin(info, account_address, coin)
-                        if remainder_pos is None:
-                            print(f"[TP-REMAINDER] {coin} is already flat after TP cleanup.")
-                            return
-                        try:
-                            _, remainder_signed_size, _, remainder_side, remainder_abs = parse_position_snapshot(
-                                remainder_pos
-                            )
-                        except RuntimeError as exc:
-                            print(f"[TP-REMAINDER] {coin} remainder check could not parse live position: {exc}")
-                            return
-
-                        if remainder_side != side or remainder_abs <= 0.0:
-                            print(f"[TP-REMAINDER] {coin} no longer has a managed residual position.")
-                            return
-
-                        print(
-                            f"[TP-REMAINDER] Residual {coin} position detected after all TP levels: "
-                            f"signed={remainder_signed_size:.8f}. Closing remainder with market_close."
+                        close_ok = await close_position_remainder_with_market_retries(
+                            info=info,
+                            exchange=exchange,
+                            account_address=account_address,
+                            coin=coin,
+                            side=side,
+                            market_slippage=market_slippage,
+                            poll_interval=poll_interval,
+                            label="TP-REMAINDER",
                         )
-                        try:
-                            resp = await exchange.market_close(coin, slippage=market_slippage)
-                            print(f"[TP-REMAINDER] market_close response: {resp}")
-                        except Exception as exc:
-                            print(f"[ERROR] TP remainder market_close failed for {coin}: {exc}")
-                            tp_remainder_close_in_progress = False
-                            continue
-
-                        await asyncio.sleep(min(max(poll_interval * 0.5, 0.25), 1.0))
-                        final_remainder_pos = await get_position_for_coin(info, account_address, coin)
-                        if final_remainder_pos is None:
-                            print(f"[TP-REMAINDER] {coin} fully closed after residual market exit.")
+                        if close_ok:
                             return
-                        print(f"[TP-REMAINDER-WARN] {coin} still appears open after residual market exit; retrying monitor.")
                         tp_remainder_close_in_progress = False
 
                 if tp_orders and use_trailing_tp and not hide_orders and not trailing_tp_armed:

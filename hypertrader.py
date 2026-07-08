@@ -267,6 +267,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Seconds between signal scans. Default: 30.0.")
     auto_parser.add_argument("--max-concurrent-scans", type=int, default=3,
                              help="Maximum markets to scan concurrently per auto loop. Default: 3.")
+    auto_parser.add_argument("--max-positions", type=int, default=3,
+                             help="Maximum concurrently open or actively managed auto positions. Default: 3.")
     auto_parser.add_argument("--min-agreement", type=int, default=0,
                              help="Intervals required to agree. 0 means all configured intervals. Default: 0.")
     auto_parser.add_argument("--adx-threshold", type=float, default=20.0,
@@ -549,6 +551,9 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         if args.max_concurrent_scans <= 0:
             print("[ERROR] --max-concurrent-scans must be > 0.")
             sys.exit(1)
+        if args.max_positions <= 0:
+            print("[ERROR] --max-positions must be > 0.")
+            sys.exit(1)
         if args.min_agreement < 0:
             print("[ERROR] --min-agreement must be >= 0.")
             sys.exit(1)
@@ -625,6 +630,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             periods=args.auto_periods,
             scan_interval=args.scan_interval,
             max_concurrent_scans=args.max_concurrent_scans,
+            max_positions=args.max_positions,
             min_agreement=args.min_agreement,
             adx_threshold=args.adx_threshold,
             take_profit_pct=args.take_profit_pct,
