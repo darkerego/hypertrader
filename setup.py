@@ -9,7 +9,7 @@ README = ROOT / "README.md"
 
 setup(
     name="hypertrader",
-    version="0.1.0",
+    version="0.1.2",
     description="Async Hyperliquid trading helper built on the async SDK.",
     long_description=README.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
@@ -26,6 +26,7 @@ setup(
         "hyperliquid-python-sdk-async",
         "python-dotenv",
         "uvloop",
+        "colored",
     ],
     extras_require={
         "auto": [
@@ -36,6 +37,7 @@ setup(
     entry_points={
         "console_scripts": [
             "hypertrader=hypertrader:main",
+            "ht=hypertrader:main",
         ],
     },
     classifiers=[

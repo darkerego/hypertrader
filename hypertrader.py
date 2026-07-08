@@ -145,6 +145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  market_maker  Event-driven MM: build a pyramiding ladder around recent volatility."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="Full documentation located at https://github.com/darkerego/hypertrader.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -18,7 +18,7 @@ from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, cp
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
-    extract_closed_pnl_from_fill
+    extract_closed_pnl_from_fill, is_rate_limit_error
 
 logger = logging.getLogger(__name__)
 _AUTO_TRADES_LOGGER: Optional[logging.Logger] = None
@@ -200,6 +200,53 @@ class AutoManagedTradeResult:
     stop_loss_pct: Optional[float]
     started_ms: int
     closed_ms: int
+
+
+@dataclass
+class AutoStartupBackfillState:
+    """Track initial REST candle backfill progress and temporary 429 pacing."""
+    enabled: bool
+    pause_seconds: float = 3.0
+    pause_between_batches: bool = False
+    complete: bool = False
+    pending_pairs: set[Tuple[str, str]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.pending_pairs is None:
+            self.pending_pairs = set()
+
+    def register_pending(self, coin: str, interval: str) -> None:
+        if not self.enabled or self.complete:
+            return
+        self.pending_pairs.add((str(coin).upper(), str(interval)))
+
+    def mark_success(self, coin: str, interval: str) -> None:
+        if not self.enabled or self.complete:
+            return
+        self.pending_pairs.discard((str(coin).upper(), str(interval)))
+        if not self.pending_pairs:
+            self.complete = True
+            if self.pause_between_batches:
+                print("[AUTO] Initial REST candle backfill completed; resuming normal scan cadence.")
+
+    def mark_non_rate_limit_failure(self, coin: str, interval: str) -> None:
+        if not self.enabled or self.complete:
+            return
+        self.pending_pairs.discard((str(coin).upper(), str(interval)))
+        if not self.pending_pairs:
+            self.complete = True
+            if self.pause_between_batches:
+                print("[AUTO] Initial REST candle backfill completed; resuming normal scan cadence.")
+
+    def mark_rate_limit(self) -> None:
+        if not self.enabled or self.complete:
+            return
+        if not self.pause_between_batches:
+            print(
+                f"[AUTO] Initial REST candle backfill hit rate limits; pausing "
+                f"{self.pause_seconds:.1f}s between scan batches until startup backfill finishes."
+            )
+        self.pause_between_batches = True
 
 
 def now_ms() -> int:
@@ -1244,6 +1291,7 @@ async def compute_auto_interval_signal(
     bb_dev: float,
     use_last_closed_candle: bool,
     use_websocket_candles: bool = False,
+    startup_backfill_state: Optional[AutoStartupBackfillState] = None,
 ) -> AutoIntervalSignal:
     """Fetch candles for one interval and compute MACD/SAR/ADX/Bollinger signal state."""
     require_talib_available()
@@ -1252,13 +1300,26 @@ async def compute_auto_interval_signal(
         raise RuntimeError(f"--auto-periods must be at least {minimum_periods} for the chosen indicator settings.")
     # TODO: Determine - is it possible to retrieve candles for multiple coins with one API call? Or is this data \
     # TODO: that is available over the websocket?
-    candles = await fetch_recent_candles(
-        info,
-        coin,
-        interval,
-        periods,
-        use_websocket_candles=use_websocket_candles,
-    )
+    if startup_backfill_state is not None:
+        startup_backfill_state.register_pending(coin, interval)
+    try:
+        candles = await fetch_recent_candles(
+            info,
+            coin,
+            interval,
+            periods,
+            use_websocket_candles=use_websocket_candles,
+        )
+    except Exception as exc:
+        if startup_backfill_state is not None:
+            if is_rate_limit_error(exc):
+                startup_backfill_state.mark_rate_limit()
+            else:
+                startup_backfill_state.mark_non_rate_limit_failure(coin, interval)
+        raise
+    else:
+        if startup_backfill_state is not None:
+            startup_backfill_state.mark_success(coin, interval)
     usable_candles = candles[:-1] if use_last_closed_candle and len(candles) > 1 else candles
 
     highs: List[float] = []
@@ -1391,6 +1452,7 @@ async def evaluate_auto_trade_decision(
     use_sar_stop_on_shortest_interval: bool,
     use_websocket_candles: bool = False,
     current_px: Optional[float] = None,
+    startup_backfill_state: Optional[AutoStartupBackfillState] = None,
 ) -> AutoTradeDecision:
     """Evaluate all configured intervals and return an aggregated trade decision."""
     snapshots: List[AutoIntervalSignal] = []
@@ -1414,6 +1476,7 @@ async def evaluate_auto_trade_decision(
                     bb_dev=bb_dev,
                     use_last_closed_candle=use_last_closed_candle,
                     use_websocket_candles=use_websocket_candles,
+                    startup_backfill_state=startup_backfill_state,
                 )
             )
         except Exception as exc:
@@ -1585,6 +1648,7 @@ async def scan_auto_trade_candidate(
     use_sar_stop_on_shortest_interval: bool,
     snapshot: AutoScanLoopSnapshot,
     use_websocket_candles: bool = False,
+    startup_backfill_state: Optional[AutoStartupBackfillState] = None,
 ) -> AutoScanCandidate:
     """Scan one market using shared loop snapshots to avoid redundant REST calls."""
     existing_pos = snapshot.positions_by_coin.get(scan_coin.upper())
@@ -1614,6 +1678,7 @@ async def scan_auto_trade_candidate(
         use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
         use_websocket_candles=use_websocket_candles,
         current_px=snapshot.mids.get(scan_coin.upper()),
+        startup_backfill_state=startup_backfill_state,
     )
     print_auto_decision(decision, scan_coin)
 
@@ -1785,7 +1850,11 @@ async def run_auto_trader(
     if not owns_clients and (account_address is None or info is None or exchange is None):
         raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     completed_trades = 0
+    _iter = 0
     auto_trades_logger = get_auto_trades_logger()
+    startup_backfill_state = AutoStartupBackfillState(
+        enabled=(coin is None and not use_websocket_candles),
+    )
 
     try:
         if owns_clients:
@@ -2044,7 +2113,17 @@ async def run_auto_trader(
                     stop_requested = True
                     stop_reason = f"completed {completed_trades} trade(s) and auto looping is disabled"
 
+        async def _sleep_until_next_scan_batch() -> None:
+            if startup_backfill_state.enabled and startup_backfill_state.pause_between_batches and not startup_backfill_state.complete:
+                print(
+                    f"[AUTO] Startup REST candle backfill still in progress; "
+                    f"sleeping {startup_backfill_state.pause_seconds:.1f}s before the normal scan interval."
+                )
+                await asyncio.sleep(startup_backfill_state.pause_seconds)
+            await asyncio.sleep(scan_interval)
+
         while True:
+            _iter +=1
             await _drain_completed_trade_tasks()
             if stop_requested:
                 if active_trade_tasks:
@@ -2159,6 +2238,7 @@ async def run_auto_trader(
                         use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
                         snapshot=shared_snapshot,
                         use_websocket_candles=use_websocket_candles,
+                        startup_backfill_state=startup_backfill_state,
                     )
 
             scan_tasks = [asyncio.create_task(_scan_with_limit(scan_coin)) for scan_coin in eligible_scan_coins]
@@ -2215,14 +2295,14 @@ async def run_auto_trader(
             await asyncio.gather(*scan_tasks, return_exceptions=True)
 
             if not launch_specs:
-                print('=' * 40 + f'Sleeping {scan_interval} seconds .. ' + '=' * 40)
-                await asyncio.sleep(scan_interval)
+                print('=' * 40 + f'Iteration: {_iter}, sleeping {scan_interval} seconds (--scan-interval). ' + '=' * 40)
+                await _sleep_until_next_scan_batch()
                 continue
 
             if dry_run:
                 for launch_coin, _launch_decision, _launch_size in launch_specs:
                     print(f"[AUTO] Dry run enabled; {launch_coin} signal will not be traded.")
-                await asyncio.sleep(scan_interval)
+                await _sleep_until_next_scan_batch()
                 continue
 
             for launch_coin, launch_decision, launch_size in launch_specs:
@@ -2256,7 +2336,7 @@ async def run_auto_trader(
                 )
 
             metrics_start_time_ms = int(time.time() * 1000)
-            await asyncio.sleep(scan_interval)
+            await _sleep_until_next_scan_batch()
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, stopping auto trader.")
     finally:

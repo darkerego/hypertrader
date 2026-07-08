@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper script around `hypertrader.py`
+
+while true; do
+
+python3 ./hypertrader.py "$@"
+sleep 60
+
+done

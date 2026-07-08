@@ -1,3 +1,8 @@
+# 2026-07-08 02:05:00 EDT
+
+- Updated `modes/auto_trader.py` startup scanning so large top-market auto runs now detect REST candle `429` rate limits, enable a temporary `3.0s` pause between scan batches, and automatically return to the normal scan cadence once the initial candle backfill completes.
+- Scoped the new pacing to early REST backfill only, leaving single-coin auto runs and websocket-candle scans unchanged after startup warms.
+
 # 2026-07-08 01:48:23 EDT
 
 - Updated `modes/auto_trader.py` so `--cooldown-after-trade` is now tracked per coin instead of as a single global auto-scan pause, which lets other markets continue scanning and opening trades while only the just-closed market is cooling down.
