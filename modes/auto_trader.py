@@ -204,49 +204,138 @@ class AutoManagedTradeResult:
 
 @dataclass
 class AutoStartupBackfillState:
-    """Track initial REST candle backfill progress and temporary 429 pacing."""
+    """Track startup candle backfill progress and block entries until it completes."""
     enabled: bool
     pause_seconds: float = 3.0
     pause_between_batches: bool = False
     complete: bool = False
+    saw_rate_limit_this_iteration: bool = False
     pending_pairs: set[Tuple[str, str]] | None = None
+    expected_pairs: set[Tuple[str, str]] | None = None
+    successful_pairs: set[Tuple[str, str]] | None = None
+    ignored_pairs: set[Tuple[str, str]] | None = None
+    excluded_coins: set[str] | None = None
 
     def __post_init__(self) -> None:
         if self.pending_pairs is None:
             self.pending_pairs = set()
+        if self.expected_pairs is None:
+            self.expected_pairs = set()
+        if self.successful_pairs is None:
+            self.successful_pairs = set()
+        if self.ignored_pairs is None:
+            self.ignored_pairs = set()
+        if self.excluded_coins is None:
+            self.excluded_coins = set()
+
+    def _refresh_completion(self) -> None:
+        if not self.enabled or self.complete or not self.expected_pairs:
+            return
+        completed_pairs = (self.successful_pairs or set()) | (self.ignored_pairs or set())
+        if completed_pairs >= self.expected_pairs:
+            self.complete = True
+            if self.pause_between_batches:
+                print("[AUTO] Initial REST candle backfill completed; resuming normal scan cadence.")
+            else:
+                print("[AUTO] Startup candle backfill completed; auto entries are now enabled.")
+
+    def set_expected_pairs(self, coins: List[str], intervals: List[str]) -> None:
+        if not self.enabled or self.complete or self.expected_pairs:
+            return
+        normalized_coins = [str(coin).upper() for coin in coins if str(coin).strip()]
+        normalized_intervals = [str(interval) for interval in intervals if str(interval).strip()]
+        self.expected_pairs = {
+            (coin, interval)
+            for coin in normalized_coins
+            for interval in normalized_intervals
+        }
+        if self.expected_pairs:
+            print(
+                f"[AUTO] Startup candle backfill tracking {len(self.expected_pairs)} "
+                f"coin/interval pair(s) before auto entries are allowed."
+            )
+
+    def begin_iteration(self) -> None:
+        if not self.enabled or self.complete:
+            return
+        self.saw_rate_limit_this_iteration = False
+
+    def finish_iteration(self) -> None:
+        if (
+            not self.enabled
+            or self.complete
+            or self.saw_rate_limit_this_iteration
+            or not self.pause_between_batches
+        ):
+            return
+        self.complete = True
+        print(
+            "[AUTO] Startup candle backfill gating cleared after a full scan iteration "
+            "completed without rate limits; auto entries are now enabled."
+        )
 
     def register_pending(self, coin: str, interval: str) -> None:
         if not self.enabled or self.complete:
             return
-        self.pending_pairs.add((str(coin).upper(), str(interval)))
+        pair = (str(coin).upper(), str(interval))
+        if self.expected_pairs and pair not in self.expected_pairs:
+            return
+        self.pending_pairs.add(pair)
 
     def mark_success(self, coin: str, interval: str) -> None:
         if not self.enabled or self.complete:
             return
-        self.pending_pairs.discard((str(coin).upper(), str(interval)))
-        if not self.pending_pairs:
-            self.complete = True
-            if self.pause_between_batches:
-                print("[AUTO] Initial REST candle backfill completed; resuming normal scan cadence.")
+        pair = (str(coin).upper(), str(interval))
+        self.pending_pairs.discard(pair)
+        if self.expected_pairs and pair in self.expected_pairs:
+            self.successful_pairs.add(pair)
+        self._refresh_completion()
 
     def mark_non_rate_limit_failure(self, coin: str, interval: str) -> None:
         if not self.enabled or self.complete:
             return
-        self.pending_pairs.discard((str(coin).upper(), str(interval)))
-        if not self.pending_pairs:
-            self.complete = True
-            if self.pause_between_batches:
-                print("[AUTO] Initial REST candle backfill completed; resuming normal scan cadence.")
+        pair = (str(coin).upper(), str(interval))
+        self.pending_pairs.discard(pair)
+
+    def mark_market_unusable(self, coin: str, reason: str = "") -> None:
+        if not self.enabled or self.complete:
+            return
+        normalized_coin = str(coin).upper()
+        first_exclusion = normalized_coin not in self.excluded_coins
+        self.excluded_coins.add(normalized_coin)
+
+        if self.expected_pairs:
+            matching_pairs = {pair for pair in self.expected_pairs if pair[0] == normalized_coin}
+            self.pending_pairs.difference_update(matching_pairs)
+            self.ignored_pairs.update(matching_pairs)
+
+        if first_exclusion:
+            suffix = f": {reason}" if reason else ""
+            print(
+                f"[AUTO] Excluding {normalized_coin} from auto scans after non-rate-limit candle failure{suffix}"
+            )
+        self._refresh_completion()
+
+    def is_coin_excluded(self, coin: str) -> bool:
+        return str(coin).upper() in (self.excluded_coins or set())
 
     def mark_rate_limit(self) -> None:
         if not self.enabled or self.complete:
             return
+        self.saw_rate_limit_this_iteration = True
         if not self.pause_between_batches:
             print(
                 f"[AUTO] Initial REST candle backfill hit rate limits; pausing "
                 f"{self.pause_seconds:.1f}s between scan batches until startup backfill finishes."
             )
         self.pause_between_batches = True
+
+    @property
+    def remaining_pairs(self) -> int:
+        if not self.enabled or self.complete:
+            return 0
+        completed_pairs = (self.successful_pairs or set()) | (self.ignored_pairs or set())
+        return max(0, len(self.expected_pairs or set()) - len(completed_pairs))
 
 
 def now_ms() -> int:
@@ -1275,6 +1364,19 @@ def last_finite_index(*arrays: Any) -> int:
     raise RuntimeError("No finite TA-Lib indicator row is available yet; fetch more candles.")
 
 
+def is_unknown_market_error(exc: BaseException, coin: str) -> bool:
+    """Return True when the candle fetch failed because the market key does not exist."""
+    normalized_coin = str(coin).upper()
+    if isinstance(exc, KeyError):
+        return str(exc).strip("'").upper() == normalized_coin
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, KeyError) and str(arg).strip("'").upper() == normalized_coin:
+            return True
+        if isinstance(arg, str) and arg.strip("'").upper() == normalized_coin:
+            return True
+    return False
+
+
 async def compute_auto_interval_signal(
     info: Info,
     coin: str,
@@ -1482,6 +1584,12 @@ async def evaluate_auto_trade_decision(
         except Exception as exc:
             errors.append(f"{interval}: {exc}")
             cp.warning(f"[AUTO-WARN] Failed to compute signal for {coin} {interval}: {exc}")
+            if startup_backfill_state is not None and is_unknown_market_error(exc, coin):
+                startup_backfill_state.mark_market_unusable(coin, str(exc))
+                break
+            if startup_backfill_state is not None and is_rate_limit_error(exc):
+                await asyncio.sleep(startup_backfill_state.pause_seconds)
+
 
     if not snapshots:
         return AutoTradeDecision(
@@ -1852,9 +1960,7 @@ async def run_auto_trader(
     completed_trades = 0
     _iter = 0
     auto_trades_logger = get_auto_trades_logger()
-    startup_backfill_state = AutoStartupBackfillState(
-        enabled=(coin is None and not use_websocket_candles),
-    )
+    startup_backfill_state = AutoStartupBackfillState(enabled=True)
 
     try:
         if owns_clients:
@@ -2120,7 +2226,8 @@ async def run_auto_trader(
                     f"sleeping {startup_backfill_state.pause_seconds:.1f}s before the normal scan interval."
                 )
                 await asyncio.sleep(startup_backfill_state.pause_seconds)
-            await asyncio.sleep(scan_interval)
+            else:
+                await asyncio.sleep(scan_interval)
 
         while True:
             _iter +=1
@@ -2194,6 +2301,20 @@ async def run_auto_trader(
                 await asyncio.sleep(scan_interval)
                 continue
 
+            if startup_backfill_state.enabled:
+                eligible_scan_coins = [
+                    scan_coin
+                    for scan_coin in eligible_scan_coins
+                    if not startup_backfill_state.is_coin_excluded(scan_coin)
+                ]
+                if not eligible_scan_coins:
+                    print("[AUTO] All scan candidates were excluded after non-rate-limit candle backfill failures.")
+                    await asyncio.sleep(scan_interval)
+                    continue
+
+            startup_backfill_state.set_expected_pairs(eligible_scan_coins, intervals)
+            startup_backfill_state.begin_iteration()
+
             shared_snapshot = await build_auto_scan_loop_snapshot(
                 info=info,
                 account_address=account_address,
@@ -2209,7 +2330,8 @@ async def run_auto_trader(
                 await asyncio.sleep(scan_interval)
                 continue
 
-            scan_concurrency = min(max_concurrent_scans, max(1, len(eligible_scan_coins)))
+            #scan_concurrency = min(max_concurrent_scans, max(1, len(eligible_scan_coins)))
+            scan_concurrency = max(1, max_concurrent_scans)
             scan_semaphore = asyncio.Semaphore(scan_concurrency)
 
             async def _scan_with_limit(scan_coin: str) -> AutoScanCandidate:
@@ -2293,9 +2415,19 @@ async def run_auto_trader(
                 logger.error(exc)
 
             await asyncio.gather(*scan_tasks, return_exceptions=True)
+            startup_backfill_state.finish_iteration()
+
+            if startup_backfill_state.enabled and not startup_backfill_state.complete:
+                print(
+                    f"[AUTO] Startup candle backfill still in progress; "
+                    f"blocking entries until {startup_backfill_state.remaining_pairs} "
+                    f"coin/interval pair(s) finish loading."
+                )
+                await _sleep_until_next_scan_batch()
+                continue
 
             if not launch_specs:
-                print('=' * 40 + f'Iteration: {_iter}, sleeping {scan_interval} seconds (--scan-interval). ' + '=' * 40)
+                print('=' * 40 + f'Iteration: {_iter}, sleeping {scan_interval} seconds (--scan-interval).' + '=' * 40)
                 await _sleep_until_next_scan_batch()
                 continue
 

@@ -611,7 +611,7 @@ async def get_open_orders_for_coin(info: Info, account_address: str, coin: str) 
 def is_rate_limit_error(exc: BaseException) -> bool:
     """Return True when the SDK surfaced a 429/rate-limit style response."""
     for arg in getattr(exc, "args", ()):
-        if arg == 429:
+        if str(arg) == '429':
             return True
         if isinstance(arg, str) and "429" in arg:
             return True

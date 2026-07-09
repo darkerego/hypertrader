@@ -1,3 +1,18 @@
+# 2026-07-08 20:20:57 EDT
+
+- Updated `modes/auto_trader.py` startup auto-entry gating so once startup backfill has encountered REST candle rate limits, the bot now unlocks normal auto entries after the first full scan iteration that finishes without any new rate-limit errors, even if some original startup coin/interval pairs are still pending.
+- Preserved the existing startup pacing and pair-tracking behavior for true ongoing rate-limit pressure, while preventing auto mode from staying stuck on the `Startup candle backfill still in progress` block after a clean recovery iteration.
+
+# 2026-07-08 20:12:13 EDT
+
+- Updated `modes/auto_trader.py` startup candle backfill handling so unknown-market candle failures such as `KeyError('KBONK')` now exclude that coin from future auto scans instead of leaving startup backfill permanently blocked.
+- Added explicit unknown-market detection for auto candle signal evaluation and treated excluded coin/interval pairs as completed for startup gating only, while preserving retry behavior for other non-rate-limit failures.
+
+# 2026-07-08 20:02:54 EDT
+
+- Updated `modes/auto_trader.py` startup candle warmup so auto mode now blocks all new entries until every coin/interval pair in the initial eligible scan set has successfully backfilled at least once.
+- Fixed startup backfill completion tracking so non-rate-limit candle fetch failures no longer incorrectly unlock trading before the missing history has actually loaded.
+
 # 2026-07-08 02:05:00 EDT
 
 - Updated `modes/auto_trader.py` startup scanning so large top-market auto runs now detect REST candle `429` rate limits, enable a temporary `3.0s` pause between scan batches, and automatically return to the normal scan cadence once the initial candle backfill completes.
