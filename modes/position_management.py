@@ -1213,6 +1213,8 @@ async def monitor_bracket_position(
     favorable_extreme: Optional[float] = None
     tp_zone_seen = False
     tp_remainder_close_in_progress = False
+    tp_remainder_baseline_abs = abs(managed_signed_size)
+    tp_remainder_fill_confirmed = False
 
     try:
         while True:
@@ -1284,6 +1286,8 @@ async def monitor_bracket_position(
                     hidden_tp_oids.clear()
                     tp_level_to_oid = build_tp_level_to_oid_map(tp_orders, tp_oids)
                     tp_remainder_close_in_progress = False
+                    tp_remainder_baseline_abs = live_pos_abs
+                    tp_remainder_fill_confirmed = False
                     if hide_orders:
                         local_stop_px, stop_source = resolve_stop_loss_trigger_px(
                             side,
@@ -1294,6 +1298,9 @@ async def monitor_bracket_position(
                 else:
                     managed_signed_size = live_signed_size
                     entry_px = live_entry_px
+
+                if live_pos_abs + PRICE_EPS < tp_remainder_baseline_abs:
+                    tp_remainder_fill_confirmed = True
 
                 if dynamic_auto_sar_stop_enabled:
                     try:
@@ -1495,6 +1502,13 @@ async def monitor_bracket_position(
                         tp_levels_exhausted = len(open_tp_orders) == 0 and not trailing_tp_armed
 
                     if tp_levels_exhausted and not tp_remainder_close_in_progress:
+                        if not tp_remainder_fill_confirmed:
+                            print(
+                                f"[TP-REMAINDER-WARN] {coin} TP ladder is absent but no TP fill was confirmed "
+                                f"(live_abs={live_pos_abs:.8f}, baseline_abs={tp_remainder_baseline_abs:.8f}). "
+                                "Leaving the position open."
+                            )
+                            continue
                         tp_remainder_close_in_progress = True
                         print(
                             f"[TP-REMAINDER] {coin} take-profit ladder is exhausted; "

@@ -1,3 +1,8 @@
+# 2026-07-09 00:57:32 EDT
+
+- Updated `modes/position_management.py` TP remainder handling so watch/enter monitors now require a confirmed managed-position reduction before treating an empty TP ladder as an exhausted take-profit sequence that should market-close the remainder.
+- Prevented spontaneous or manual TP-order disappearance from flattening a still-open position; if reduce-only TP orders are missing but no TP fill was observed, the bot now logs `[TP-REMAINDER-WARN]` and leaves the position open.
+
 # 2026-07-08 20:20:57 EDT
 
 - Updated `modes/auto_trader.py` startup auto-entry gating so once startup backfill has encountered REST candle rate limits, the bot now unlocks normal auto entries after the first full scan iteration that finishes without any new rate-limit errors, even if some original startup coin/interval pairs are still pending.
