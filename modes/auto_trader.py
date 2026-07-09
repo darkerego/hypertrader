@@ -2226,8 +2226,8 @@ async def run_auto_trader(
                     f"sleeping {startup_backfill_state.pause_seconds:.1f}s before the normal scan interval."
                 )
                 await asyncio.sleep(startup_backfill_state.pause_seconds)
-            else:
-                await asyncio.sleep(scan_interval)
+
+            await asyncio.sleep(scan_interval)
 
         while True:
             _iter +=1
