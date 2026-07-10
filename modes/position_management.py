@@ -13,7 +13,7 @@ from utils.helpers import init_clients, get_position_for_coin, \
     position_is_directional_add, \
     fmt_optional_float, format_account_metrics, is_rate_limit_error, \
     round_size_for_hyperliquid, get_position_size_for_coin, AccountRuntimeMetrics, get_best_bid_ask, \
-    round_price_for_hyperliquid, extract_order_error, close_clients, fetch_recent_candles
+    round_price_for_hyperliquid, extract_order_error, close_clients, fetch_recent_candles, get_ws_cache
 
 try:
     import numpy as np
@@ -57,10 +57,17 @@ async def get_frontend_open_orders_for_coin(
         info: Info,
         account_address: str,
         coin: str,
+        *,
+        force_http: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return frontend open orders for a coin, including reduceOnly/isTrigger fields."""
     try:
-        orders = await info.frontend_open_orders(account_address)
+        cache = get_ws_cache(info)
+        if cache is not None and not force_http:
+            cached_orders = await cache.get_frontend_open_orders(force_refresh=False)
+            orders = cached_orders if cached_orders is not None else await info.frontend_open_orders(account_address)
+        else:
+            orders = await info.frontend_open_orders(account_address)
     except Exception:
         logging.getLogger("hypertrader").exception(
             "[WARN] Failed to fetch frontend open orders for %s.",
@@ -308,7 +315,7 @@ async def cancel_entry_orders_for_coin(
     order snapshot and removes any leftover non-reduce-only orders for the same
     coin/side. Reduce-only TP orders are intentionally left alone.
     """
-    orders = await get_frontend_open_orders_for_coin(info, account_address, coin)
+    orders = await get_frontend_open_orders_for_coin(info, account_address, coin, force_http=True)
     oids: List[int] = []
     for order in orders:
         try:
@@ -327,7 +334,7 @@ async def cancel_entry_orders_for_coin(
     # limit orders, so anything found here before market fallback is treated as
     # an entry-order candidate.
     if not oids:
-        fallback_orders = await get_open_orders_for_coin(info, account_address, coin)
+        fallback_orders = await get_open_orders_for_coin(info, account_address, coin, force_http=True)
         for order in fallback_orders:
             try:
                 if is_buy is not None and not order_side_matches(order, is_buy):
@@ -395,7 +402,7 @@ async def cancel_reduce_only_orders_for_coin(
         only_tpsl: bool = False,
 ) -> None:
     """Cancel reduce-only orders for a coin, optionally limiting to TP/SL trigger orders."""
-    orders = await get_frontend_open_orders_for_coin(info, account_address, coin)
+    orders = await get_frontend_open_orders_for_coin(info, account_address, coin, force_http=True)
     oids: List[int] = []
     for order in orders:
         try:
@@ -418,7 +425,7 @@ async def get_open_reduce_only_take_profit_orders_for_coin(
         coin: str,
 ) -> List[Dict[str, Any]]:
     """Return open reduce-only non-trigger TP limit orders for a coin."""
-    orders = await get_frontend_open_orders_for_coin(info, account_address, coin)
+    orders = await get_frontend_open_orders_for_coin(info, account_address, coin, force_http=False)
     tp_orders: List[Dict[str, Any]] = []
     for order in orders:
         try:
@@ -532,7 +539,7 @@ async def exit_on_tp_reversal(
     limit_oids = extract_resting_oids(limit_resp)
 
     await asyncio.sleep(min(max(poll_interval * 0.25, 0.1), 0.5))
-    live_pos = await get_position_for_coin(info, account_address, coin)
+    live_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
     if live_pos is None:
         print(f"[TP-REVERSAL EXIT] {coin} fully closed on the limit order.")
         return True
@@ -568,7 +575,7 @@ async def exit_on_tp_reversal(
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         await asyncio.sleep(min(max(poll_interval, 0.2), 1.0))
-        live_pos = await get_position_for_coin(info, account_address, coin)
+        live_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
         if live_pos is None:
             print(f"[TP-REVERSAL EXIT] {coin} flat after paired limit/stop exit.")
             return True
@@ -587,7 +594,7 @@ async def exit_on_tp_reversal(
     if stop_oid is not None:
         await cancel_oids(exchange, coin, [stop_oid], "tp reversal stop orders")
 
-    live_pos = await get_position_for_coin(info, account_address, coin)
+    live_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
     if live_pos is None:
         print(f"[TP-REVERSAL EXIT] {coin} flat after canceling remaining exit orders.")
         return True
@@ -621,7 +628,7 @@ async def close_position_remainder_with_market_retries(
         await cancel_reduce_only_orders_for_coin(info, exchange, account_address, coin, only_tpsl=False)
         await asyncio.sleep(settle_before_close)
 
-        remainder_pos = await get_position_for_coin(info, account_address, coin)
+        remainder_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
         if remainder_pos is None:
             print(f"[{label}] {coin} is already flat after cleanup.")
             return True
@@ -651,7 +658,7 @@ async def close_position_remainder_with_market_retries(
             continue
 
         await asyncio.sleep(settle_after_close)
-        final_remainder_pos = await get_position_for_coin(info, account_address, coin)
+        final_remainder_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
         if final_remainder_pos is None:
             print(f"[{label}] {coin} fully closed after residual market exit.")
             return True
@@ -763,7 +770,7 @@ async def enter_position_with_reposting_limit(
         raise RuntimeError("entry_tif must be Alo or Gtc.")
 
     size = await round_size_for_hyperliquid(info, coin, size)
-    initial_pos = await get_position_size_for_coin(info, account_address, coin)
+    initial_pos = await get_position_size_for_coin(info, account_address, coin, force_http=True)
     direction_label = "LONG" if is_buy else "SHORT"
 
     if initial_pos != 0.0:
@@ -789,11 +796,11 @@ async def enter_position_with_reposting_limit(
 
     async def get_entry_progress() -> Tuple[float, float, float, str, AccountRuntimeMetrics]:
         """Return current_pos, filled_delta, remaining_size, formatted uPnL, account metrics."""
-        _current_pos = await get_position_size_for_coin(info, account_address, coin)
+        _current_pos = await get_position_size_for_coin(info, account_address, coin, force_http=True)
         filled_delta = signed_position_delta(initial_pos, _current_pos, is_buy)
         remaining_size = max(0.0, size - filled_delta)
 
-        pos_snapshot = await get_position_for_coin(info, account_address, coin)
+        pos_snapshot = await get_position_for_coin(info, account_address, coin, force_http=True)
         mids = await get_all_mids(info)
         mid_price_raw = mids.get(coin)
         _upnl_str = "N/A"
@@ -872,6 +879,7 @@ async def enter_position_with_reposting_limit(
                 f"[ENTRY {attempt}/{retries}] modifying oid={active_oid} -> "
                 f"{side} {remaining:.8f} {coin} @ {limit_px:.8f} ({entry_tif}, top-of-book)"
             )
+            prev_active_oid = active_oid
             try:
                 resp = await exchange.modify_order(
                     active_oid,
@@ -898,6 +906,24 @@ async def enter_position_with_reposting_limit(
                     active_oid = None
                 await asyncio.sleep(repost_interval)
                 continue
+
+            resting_oids = extract_resting_oids(resp)
+            if resting_oids:
+                new_oid = int(resting_oids[0])
+                if new_oid != active_oid:
+                    print(f"[ENTRY {attempt}] active entry oid updated {active_oid} -> {new_oid}")
+                active_oid = new_oid
+            else:
+                filled_now = extract_filled_qty(resp)
+                if filled_now > 0.0:
+                    print(f"[ENTRY {attempt}] modify filled {filled_now:.8f}; clearing active oid.")
+                    active_oid = None
+                else:
+                    print(
+                        f"[ENTRY {attempt}] modify returned no resting oid or fill for prior oid={prev_active_oid}; "
+                        "will re-check position before another modify."
+                    )
+                    active_oid = None
 
         await asyncio.sleep(repost_interval)
 
@@ -965,7 +991,7 @@ async def enter_position_with_reposting_limit(
             )
 
     await asyncio.sleep(max(0.25, repost_interval))
-    final_pos = await get_position_for_coin(info, account_address, coin)
+    final_pos = await get_position_for_coin(info, account_address, coin, force_http=True)
     if final_pos is None:
         raise RuntimeError(f"No open {coin} position found after entry attempts.")
 

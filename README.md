@@ -2,6 +2,13 @@
 
 Async Hyperliquid trading helper built around the async SDK from `darkerego/hyperliquid-python-sdk-async`.
 
+## Warning
+
+This is alpha software currently in development. Trade carefully, and if you encounter 
+any problems, please open an issue so that I can fic them.
+
+## About
+
 The canonical bot file in this repo is [`hypertrader.py`](/media/anon/development/anon/PycharmProjects/hypertrader/hypertrader.py). It provides five modes:
 
 - `enter`: top-of-book limit entry with modify-order repricing, optional market fallback, and TP/SL management

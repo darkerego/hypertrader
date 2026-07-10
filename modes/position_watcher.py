@@ -6,11 +6,11 @@ from typing import Optional, List, Dict, Any
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
-from modes.auto_trader import compute_default_stop_loss_pct
 from modes.position_management import monitor_bracket_position, rebuild_bracket_orders
 from utils.constants import WATCH_RETRY_SLEEP_SECONDS
 from utils.helpers import init_clients, get_all_open_positions, get_all_mids, compute_position_unrealized_pnl, \
-    get_account_runtime_metrics, format_account_metrics, is_rate_limit_error, close_clients
+    get_account_runtime_metrics, format_account_metrics, is_rate_limit_error, close_clients, \
+    compute_default_stop_loss_pct
 
 
 async def attach_bracket_to_existing_position(

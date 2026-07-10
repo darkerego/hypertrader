@@ -9,7 +9,7 @@ README = ROOT / "README.md"
 
 setup(
     name="hypertrader",
-    version="0.1.5",
+    version="0.1.6",
     description="Async Hyperliquid trading helper built on the async SDK.",
     long_description=README.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",

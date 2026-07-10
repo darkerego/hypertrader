@@ -23,10 +23,9 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-import uvloop
+
 from hyperliquid.info import Info
 
-from modes.auto_trader import run_auto_trader
 from modes.market_maker import run_market_maker
 from modes.position_management import run_bracket_entry
 from modes.position_watcher import run_position_watcher
@@ -36,16 +35,14 @@ from utils.helpers import parse_fractional_pct
 from utils.style import install_pretty_stdout
 
 try:
-    import numpy as np
-    import talib
-except Exception:  # TA-Lib is only required for the auto command.
-    np = None  # type: ignore[assignment]
-    talib = None  # type: ignore[assignment]
-
-try:
     os.mkdir("logs")
 except FileExistsError:
     pass
+
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
 
 decimal.getcontext().prec = 4
 install_pretty_stdout()
@@ -525,6 +522,8 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         return
 
     if args.command == "auto":
+        from modes.auto_trader import run_auto_trader
+
         if args.size is not None and args.size <= 0.0:
             print("[ERROR] --size must be > 0.")
             sys.exit(1)
@@ -744,5 +743,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 
 if __name__ == "__main__":
-    uvloop.install()
+    if uvloop:
+        uvloop.install()
+    else:
+        print('[WARN]: Please install uvloop for increased performance. Reverting to standard event loop.')
     main()

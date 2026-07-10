@@ -5,8 +5,6 @@ import logging
 import math
 import os
 import time
-import numpy as np
-import talib
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -18,10 +16,17 @@ from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, cp
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
-    extract_closed_pnl_from_fill, is_rate_limit_error
+    extract_closed_pnl_from_fill, is_rate_limit_error, get_user_fills_since
 
 logger = logging.getLogger(__name__)
 _AUTO_TRADES_LOGGER: Optional[logging.Logger] = None
+
+try:
+    import numpy as np
+    import talib
+except Exception:  # TA-Lib is only required for the auto command.
+    np = None  # type: ignore[assignment]
+    talib = None  # type: ignore[assignment]
 
 
 def get_auto_trades_logger() -> logging.Logger:
@@ -825,7 +830,7 @@ async def build_auto_scan_loop_snapshot(
     account_balance = extract_account_balance_from_user_state(user_state)
 
     mids_task = asyncio.create_task(get_all_mids(info))
-    fills_task = asyncio.create_task(info.user_fills_by_time(account_address, metrics_start_time_ms))
+    fills_task = asyncio.create_task(get_user_fills_since(info, account_address, metrics_start_time_ms))
 
     mids = await mids_task
 
@@ -2410,7 +2415,12 @@ async def run_auto_trader(
                     launch_specs.append((candidate.coin, candidate.decision, resolved_size))
                     reserved_coins.add(candidate.coin)
                     if len(launch_specs) >= available_slots:
-                        continue
+                        print(
+                            f"[AUTO] Reached max new launches for this scan batch "
+                            f"({len(launch_specs)}/{available_slots} available slot(s)); "
+                            f"deferring remaining candidates."
+                        )
+                        break
             except Exception as exc:
                 logger.error(exc)
 

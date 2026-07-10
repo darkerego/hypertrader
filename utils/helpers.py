@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from typing import List, Any, Tuple, Optional, Dict, Awaitable
 
 import eth_account
-import numpy as np
-import talib
 from dotenv import load_dotenv
 from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
@@ -69,11 +67,13 @@ def parse_fractional_pct(value: Any, *, field_name: str) -> float:
 # Credentials / clients
 # ---------------------------------------------------------------------------
 
-def load_credentials() -> Tuple[str, str]:
+def load_credentials(testnet: bool =False) -> Tuple[str, str]:
     """Load Hyperliquid credentials from environment variables."""
     load_dotenv()
-
-    secret_key = os.getenv("HYPERLIQUID_SECRET_KEY")
+    if testnet:
+        secret_key = os.getenv("HYPERLIQUID_TESTNET_SECRET_KEY")
+    else:
+        secret_key = os.getenv("HYPERLIQUID_SECRET_KEY")
     account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
 
     if not secret_key:
@@ -102,8 +102,9 @@ class HyperliquidWebsocketCache:
       * userEvents    -> cached for diagnostics / future event-driven position refresh
       * orderUpdates  -> cached for diagnostics / future order-state refresh
 
-    Position snapshots still use user_state over HTTP because the bracket logic needs
-    authoritative size and average-entry data before rebuilding TP/SL orders.
+    There is no native websocket subscription for clearinghouseState or openOrders in
+    the async SDK. For those, this class keeps REST-backed snapshots that are marked
+    dirty by userEvents / userFills / orderUpdates and refreshed on demand.
     """
 
     def __init__(
@@ -131,9 +132,36 @@ class HyperliquidWebsocketCache:
         self._bbo_sub_ids: Dict[str, int] = {}
 
         self._user_events_sub_id: Optional[int] = None
+        self._user_fills_sub_id: Optional[int] = None
         self._order_updates_sub_id: Optional[int] = None
         self.last_user_event: Optional[Dict[str, Any]] = None
+        self.last_user_fills: Optional[Dict[str, Any]] = None
         self.last_order_update: Optional[Dict[str, Any]] = None
+
+        self._user_state: Optional[Dict[str, Any]] = None
+        self._user_state_updated_at = 0.0
+        self._user_state_ready = asyncio.Event()
+        self._user_state_lock = asyncio.Lock()
+        self._user_state_dirty = True
+
+        self._open_orders: List[Dict[str, Any]] = []
+        self._open_orders_updated_at = 0.0
+        self._open_orders_ready = asyncio.Event()
+        self._open_orders_lock = asyncio.Lock()
+        self._open_orders_dirty = True
+
+        self._frontend_open_orders: List[Dict[str, Any]] = []
+        self._frontend_open_orders_updated_at = 0.0
+        self._frontend_open_orders_ready = asyncio.Event()
+        self._frontend_open_orders_lock = asyncio.Lock()
+        self._frontend_open_orders_dirty = True
+
+        self._user_fills: List[Dict[str, Any]] = []
+        self._user_fill_keys: set[Tuple[Any, ...]] = set()
+        self._user_fills_updated_at = 0.0
+        self._user_fills_ready = asyncio.Event()
+        self._user_fills_lock = asyncio.Lock()
+        self._user_fills_seed_start_ms: Optional[int] = None
         self._candle_buffers: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         self._candle_requested_periods: Dict[Tuple[str, str], int] = {}
         self._candle_updated_at: Dict[Tuple[str, str], float] = {}
@@ -224,6 +252,8 @@ class HyperliquidWebsocketCache:
         for sub, attr_name, label, callback in (
                 ({"type": "userEvents", "user": self.account_address}, "_user_events_sub_id", "userEvents",
                  self._on_user_event),
+                ({"type": "userFills", "user": self.account_address}, "_user_fills_sub_id", "userFills",
+                 self._on_user_fills),
                 ({"type": "orderUpdates", "user": self.account_address}, "_order_updates_sub_id", "orderUpdates",
                  self._on_order_update),
         ):
@@ -242,6 +272,7 @@ class HyperliquidWebsocketCache:
         unsubscribe_specs: List[Tuple[Dict[str, Any], Optional[int], str]] = [
             ({"type": "allMids"}, self._mids_sub_id, "allMids"),
             ({"type": "userEvents", "user": self.account_address}, self._user_events_sub_id, "userEvents"),
+            ({"type": "userFills", "user": self.account_address}, self._user_fills_sub_id, "userFills"),
             ({"type": "orderUpdates", "user": self.account_address}, self._order_updates_sub_id, "orderUpdates"),
         ]
         for coin, sub_id in list(self._bbo_sub_ids.items()):
@@ -306,9 +337,30 @@ class HyperliquidWebsocketCache:
 
     def _on_user_event(self, msg: Dict[str, Any]) -> None:
         self.last_user_event = msg
+        data = msg.get("data", {}) if isinstance(msg, dict) else {}
+        if isinstance(data, dict):
+            fills = data.get("fills")
+            if isinstance(fills, list) and fills:
+                self._merge_user_fills(fills, replace=False)
+        self._user_state_dirty = True
+        self._open_orders_dirty = True
+        self._frontend_open_orders_dirty = True
+
+    def _on_user_fills(self, msg: Dict[str, Any]) -> None:
+        self.last_user_fills = msg
+        data = msg.get("data", {}) if isinstance(msg, dict) else {}
+        if not isinstance(data, dict):
+            return
+        fills = data.get("fills")
+        if isinstance(fills, list):
+            self._merge_user_fills(fills, replace=bool(data.get("isSnapshot")))
+        self._user_state_dirty = True
 
     def _on_order_update(self, msg: Dict[str, Any]) -> None:
         self.last_order_update = msg
+        self._open_orders_dirty = True
+        self._frontend_open_orders_dirty = True
+        self._user_state_dirty = True
 
     def _on_candle(self, requested_coin: str, requested_interval: str, msg: Dict[str, Any]) -> None:
         data = msg.get("data", {}) if isinstance(msg, dict) else {}
@@ -423,6 +475,157 @@ class HyperliquidWebsocketCache:
             return None
         return [dict(candle) for candle in candles[-periods:]]
 
+    @staticmethod
+    def _extract_fill_time_ms(fill: Dict[str, Any]) -> int:
+        for key in ("time", "timestamp"):
+            try:
+                value = fill.get(key)
+                if value is not None:
+                    return int(float(value))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return 0
+
+    @classmethod
+    def _fill_cache_key(cls, fill: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (
+            fill.get("tid"),
+            fill.get("hash"),
+            fill.get("oid"),
+            fill.get("coin"),
+            fill.get("px"),
+            fill.get("sz"),
+            cls._extract_fill_time_ms(fill),
+        )
+
+    def _merge_user_fills(self, fills: List[Dict[str, Any]], replace: bool) -> None:
+        if replace:
+            self._user_fills = []
+            self._user_fill_keys.clear()
+
+        changed = False
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            fill_copy = dict(fill)
+            cache_key = self._fill_cache_key(fill_copy)
+            if cache_key in self._user_fill_keys:
+                continue
+            self._user_fill_keys.add(cache_key)
+            self._user_fills.append(fill_copy)
+            changed = True
+
+        if changed or replace:
+            self._user_fills.sort(key=self._extract_fill_time_ms)
+            self._user_fills_updated_at = time.monotonic()
+            self._user_fills_ready.set()
+
+    async def get_user_state(self, *, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        if (
+            not force_refresh
+            and not self._user_state_dirty
+            and self._is_fresh(self._user_state_updated_at, self.max_age_seconds)
+            and self._user_state is not None
+        ):
+            return dict(self._user_state)
+
+        async with self._user_state_lock:
+            if (
+                not force_refresh
+                and not self._user_state_dirty
+                and self._is_fresh(self._user_state_updated_at, self.max_age_seconds)
+                and self._user_state is not None
+            ):
+                return dict(self._user_state)
+
+            user_state = await self.info.user_state(self.account_address)
+            if not isinstance(user_state, dict):
+                return None
+            self._user_state = dict(user_state)
+            self._user_state_updated_at = time.monotonic()
+            self._user_state_dirty = False
+            self._user_state_ready.set()
+            return dict(self._user_state)
+
+    async def get_open_orders(self, *, force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+        if not self.enabled:
+            return None
+        if (
+            not force_refresh
+            and not self._open_orders_dirty
+            and self._is_fresh(self._open_orders_updated_at, self.max_age_seconds)
+        ):
+            return [dict(order) for order in self._open_orders]
+
+        async with self._open_orders_lock:
+            if (
+                not force_refresh
+                and not self._open_orders_dirty
+                and self._is_fresh(self._open_orders_updated_at, self.max_age_seconds)
+            ):
+                return [dict(order) for order in self._open_orders]
+
+            open_orders = await self.info.open_orders(self.account_address)
+            if not isinstance(open_orders, list):
+                return None
+            self._open_orders = [dict(order) for order in open_orders if isinstance(order, dict)]
+            self._open_orders_updated_at = time.monotonic()
+            self._open_orders_dirty = False
+            self._open_orders_ready.set()
+            return [dict(order) for order in self._open_orders]
+
+    async def get_frontend_open_orders(self, *, force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+        if not self.enabled:
+            return None
+        if (
+            not force_refresh
+            and not self._frontend_open_orders_dirty
+            and self._is_fresh(self._frontend_open_orders_updated_at, self.max_age_seconds)
+        ):
+            return [dict(order) for order in self._frontend_open_orders]
+
+        async with self._frontend_open_orders_lock:
+            if (
+                not force_refresh
+                and not self._frontend_open_orders_dirty
+                and self._is_fresh(self._frontend_open_orders_updated_at, self.max_age_seconds)
+            ):
+                return [dict(order) for order in self._frontend_open_orders]
+
+            frontend_orders = await self.info.frontend_open_orders(self.account_address)
+            if not isinstance(frontend_orders, list):
+                return None
+            self._frontend_open_orders = [dict(order) for order in frontend_orders if isinstance(order, dict)]
+            self._frontend_open_orders_updated_at = time.monotonic()
+            self._frontend_open_orders_dirty = False
+            self._frontend_open_orders_ready.set()
+            return [dict(order) for order in self._frontend_open_orders]
+
+    async def get_user_fills_since(self, start_time_ms: int) -> Optional[List[Dict[str, Any]]]:
+        if not self.enabled:
+            return None
+
+        async with self._user_fills_lock:
+            need_seed = (
+                self._user_fills_seed_start_ms is None
+                or start_time_ms < self._user_fills_seed_start_ms
+                or not self._user_fills_ready.is_set()
+            )
+            if need_seed:
+                fills = await self.info.user_fills_by_time(self.account_address, start_time_ms)
+                if not isinstance(fills, list):
+                    return None
+                self._user_fills_seed_start_ms = start_time_ms
+                self._merge_user_fills([dict(fill) for fill in fills if isinstance(fill, dict)], replace=True)
+
+            return [
+                dict(fill)
+                for fill in self._user_fills
+                if self._extract_fill_time_ms(fill) >= start_time_ms
+            ]
+
 
 def get_ws_cache(info: Info) -> Optional[HyperliquidWebsocketCache]:
     cache = getattr(info, "ws_cache", None)
@@ -433,7 +636,7 @@ def get_ws_cache(info: Info) -> Optional[HyperliquidWebsocketCache]:
 
 async def init_clients(use_testnet: bool, use_websocket: bool = True) -> Tuple[str, Info, Exchange]:
     """Initialize async Info and Exchange clients for Hyperliquid."""
-    secret_key, account_address = load_credentials()
+    secret_key, account_address = load_credentials(use_testnet)
     api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
     account: LocalAccount = eth_account.Account.from_key(secret_key)
 
@@ -585,10 +788,22 @@ async def get_best_bid_ask(info: Info, coin: str) -> Tuple[Optional[float], Opti
     return best_bid, best_ask
 
 
-async def get_open_orders_for_coin(info: Info, account_address: str, coin: str) -> List[Dict[str, Any]]:
+async def get_open_orders_for_coin(
+        info: Info,
+        account_address: str,
+        coin: str,
+        *,
+        force_http: bool = False,
+) -> List[Dict[str, Any]]:
     """Return open orders for a specific coin."""
     try:
-        open_orders = await info.open_orders(account_address)
+        open_orders: Any
+        cache = get_ws_cache(info)
+        if cache is not None and not force_http:
+            cached_orders = await cache.get_open_orders(force_refresh=False)
+            open_orders = cached_orders if cached_orders is not None else await info.open_orders(account_address)
+        else:
+            open_orders = await info.open_orders(account_address)
     except Exception:
         logging.getLogger("hypertrader").exception(
             "[WARN] Failed to fetch open orders for %s.",
@@ -627,6 +842,7 @@ async def get_user_state_with_retry(
         context_label: str,
         coin: Optional[str] = None,
         retry_sleep: float = WATCH_RETRY_SLEEP_SECONDS,
+        force_http: bool = False,
 ) -> Dict[str, Any]:
     """Fetch user_state and keep retrying on Hyperliquid rate limits."""
     coin_label = coin.upper() if coin else "ALL"
@@ -634,7 +850,12 @@ async def get_user_state_with_retry(
     while True:
         attempt += 1
         try:
-            user_state = await info.user_state(account_address)
+            cache = get_ws_cache(info)
+            if cache is not None and not force_http:
+                cached_state = await cache.get_user_state(force_refresh=False)
+                user_state = cached_state if cached_state is not None else await info.user_state(account_address)
+            else:
+                user_state = await info.user_state(account_address)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -656,12 +877,18 @@ async def get_user_state_with_retry(
 # Position helpers
 # ---------------------------------------------------------------------------
 
-async def get_all_open_positions(info: Info, account_address: str) -> List[Dict[str, Any]]:
+async def get_all_open_positions(
+        info: Info,
+        account_address: str,
+        *,
+        force_http: bool = False,
+) -> List[Dict[str, Any]]:
     """Return a list of open perp positions for the account."""
     user_state = await get_user_state_with_retry(
         info,
         account_address,
         context_label="get_all_open_positions",
+        force_http=force_http,
     )
     asset_positions = user_state.get("assetPositions", [])
     open_positions: List[Dict[str, Any]] = []
@@ -678,13 +905,20 @@ async def get_all_open_positions(info: Info, account_address: str) -> List[Dict[
     return open_positions
 
 
-async def get_position_size_for_coin(info: Info, account_address: str, coin: str) -> float:
+async def get_position_size_for_coin(
+        info: Info,
+        account_address: str,
+        coin: str,
+        *,
+        force_http: bool = False,
+) -> float:
     """Return signed position size for a coin, or 0.0 if flat/not found."""
     user_state = await get_user_state_with_retry(
         info,
         account_address,
         context_label="get_position_size_for_coin",
         coin=coin,
+        force_http=force_http,
     )
     asset_positions = user_state.get("assetPositions", [])
     for asset_pos in asset_positions:
@@ -701,6 +935,8 @@ async def get_position_for_coin(
         info: Info,
         account_address: str,
         coin: str,
+        *,
+        force_http: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Return full position dict for a coin if the account has a non-zero position."""
     user_state = await get_user_state_with_retry(
@@ -708,6 +944,7 @@ async def get_position_for_coin(
         account_address,
         context_label="get_position_for_coin",
         coin=coin,
+        force_http=force_http,
     )
     for asset_pos in user_state.get("assetPositions", []):
         pos = asset_pos.get("position", {})
@@ -859,7 +1096,7 @@ async def get_realized_pnl_since(
         return None
 
     try:
-        fills = await info.user_fills_by_time(account_address, start_time_ms)
+        fills = await get_user_fills_since(info, account_address, start_time_ms)
     except Exception:
         logging.getLogger("hypertrader").exception(
             "[METRICS] Failed to fetch user fills since %s for coin=%s.",
@@ -885,6 +1122,29 @@ async def get_realized_pnl_since(
                 k in fill for k in ("closedPnl", "closedPnL", "realizedPnl", "realizedPnL", "realized_pnl")):
             found = True
     return total if found or fills else 0.0
+
+
+async def get_user_fills_since(
+        info: Info,
+        account_address: str,
+        start_time_ms: int,
+        *,
+        end_time_ms: Optional[int] = None,
+        aggregate_by_time: bool = False,
+        force_http: bool = False,
+) -> Any:
+    """Return fills since start_time_ms, using the websocket-backed cache when safe."""
+    cache = get_ws_cache(info)
+    if cache is not None and not force_http and end_time_ms is None and not aggregate_by_time:
+        cached_fills = await cache.get_user_fills_since(start_time_ms)
+        if cached_fills is not None:
+            return cached_fills
+    return await info.user_fills_by_time(
+        account_address,
+        start_time_ms,
+        end_time_ms,
+        aggregate_by_time=aggregate_by_time,
+    )
 
 def extract_account_balance_from_user_state(user_state: Dict[str, Any]) -> Optional[float]:
     """Extract current Hyperliquid account value from a clearinghouseState response."""
