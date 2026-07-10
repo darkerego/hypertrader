@@ -1,6 +1,6 @@
 # Hypertrader
 
-Async Hyperliquid trading helper built around the async SDK from `darkerego/hyperliquid-python-sdk-async`.
+Async Hyperliquid trading helper built around my async SDK: [hyperliquid-python-sdk-async](https://github.com/darkerego/hyperliquid-python-sdk-async).
 
 ## Warning
 
@@ -65,6 +65,9 @@ https://ta-lib.org/install/#linux
 
 ## Configuration
 
+
+##### [*] Account creation:
+
 1) Create a hyperliquid account with referral code `DARKEREGO` with this URL: 
 
     [https://app.hyperliquid.xyz/join/DARKEREGO](https://app.hyperliquid.xyz/join/DARKEREGO)
@@ -78,10 +81,12 @@ https://ta-lib.org/install/#linux
 ```text
 HYPERLIQUID_SECRET_KEY=...
 HYPERLIQUID_ACCOUNT_ADDRESS=...
+HYPERLIQUID_TESTNET_SECRET_KEY # optional, for testnet
 ```
 
 - `HYPERLIQUID_SECRET_KEY`: private key for the trading wallet or API wallet (the API key you just created)
 - `HYPERLIQUID_ACCOUNT_ADDRESS`: main account address used for the account state
+- `HYPERLIQUID_TESTNET_SECRET_KEY`: optional testnet API key
 
 Do not commit real credentials.
 
@@ -111,7 +116,13 @@ Enter, let TP level 1 fill, then cancel the rest of the ladder and trail the rem
 python3 hypertrader.py enter BTC long --size 0.1 --take-profit-pct 0.01 --trailing-tp
 ```
 
-Watch an existing position and attach management:
+Watch all perpetual markets for new and currently opened positions and attach management.
+
+```bash
+python3 hypertrader.py watch BTC --take-profit-pct 0.01 --manage-existing
+```
+
+Watch an existing position on a specific market and attach management:
 
 ```bash
 python3 hypertrader.py watch BTC --take-profit-pct 0.01 --manage-existing
@@ -123,13 +134,26 @@ Watch a position and switch from the TP ladder to a trailing TP after TP level 1
 python3 hypertrader.py watch BTC --take-profit-pct 0.01 --manage-existing --trailing-tp
 ```
 
-Run local trailing management:
+Run local trailing management for all perpetual markets:
+
+```bash
+python3 hypertrader.py trailing --trail-pct 0.01
+```
+
+
+Run local trailing management for a specific market:
 
 ```bash
 python3 hypertrader.py trailing BTC --trail-pct 0.01
 ```
 
-Dry-run auto mode across short intervals:
+Dry-run auto mode across the top 15 markets by volume concurrently, open positions with 10% of accounts' collateral:
+
+```bash
+python3 hypertrader.py auto --intervals "1m 3m 5m" --top-markets 15 --size-pct 10 --dry-run
+```
+
+Dry-run auto mode across short intervals on a specific market only with a static position size:
 
 ```bash
 python3 hypertrader.py auto SOL --intervals "1m 3m 5m" --size 10 --dry-run
