@@ -1466,7 +1466,7 @@ async def monitor_bracket_position(
                                 hidden_tp_oids[level] = oids
                                 tp_oids.extend(oids)
 
-                if ((use_trailing_tp and hide_orders and tp_trigger_px is not None) or trailing_tp_armed):
+                if (use_trailing_tp and hide_orders and tp_trigger_px is not None) or trailing_tp_armed:
                     if not trailing_tp_armed and tp_zone_seen:
                         trailing_tp_armed = True
                         trailing_tp_stop_px = compute_trailing_take_profit_stop_px(

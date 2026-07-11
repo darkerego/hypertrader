@@ -9,7 +9,7 @@ README = ROOT / "README.md"
 
 setup(
     name="hypertrader",
-    version="0.1.6",
+    version="0.1.7",
     description="Async Hyperliquid trading helper built on the async SDK.",
     long_description=README.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
@@ -18,7 +18,7 @@ setup(
     repository = "https://github.com/darkerego/hypertrader",
     homepage = "https://github.com/darkerego/hypertrader",
     license = "MIT",
-    packages=find_namespace_packages(include=["modes", "modes.*", "utils", "utils.*"]),
+    packages=find_namespace_packages(include=["modes", "modes.*", "utils", "utils.*", "strategies", "strategies.*"]),
     include_package_data=True,
     python_requires=">=3.10",
     install_requires=[

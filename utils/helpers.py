@@ -72,9 +72,10 @@ def load_credentials(testnet: bool =False) -> Tuple[str, str]:
     load_dotenv()
     if testnet:
         secret_key = os.getenv("HYPERLIQUID_TESTNET_SECRET_KEY")
+        account_address = os.getenv("HYPERLIQUID_TESTNET_ACCOUNT_ADDRESS")
     else:
         secret_key = os.getenv("HYPERLIQUID_SECRET_KEY")
-    account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
+        account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
 
     if not secret_key:
         raise RuntimeError(
@@ -1215,34 +1216,3 @@ def compute_default_stop_loss_pct(
     if take_profit_pct is not None:
         return take_profit_pct * 0.5
     return None
-
-
-
-
-
-
-
-
-###
-
-async def run_current_coros(coro_list: list[Awaitable]):
-    jobs = []
-    for x, coro in enumerate(coro_list):
-        jobs.append((x, coro))
-    await asyncio.gather(*jobs)
-
-    queue = AsyncTaskQueue(jobs=jobs, concurrency=10)
-
-    async for result in queue:
-        if result.ok:
-            print(
-                f"[ok]   index={result.index:02d} "
-                f"elapsed={result.elapsed:.2f}s "
-                f"value={result.value}"
-            )
-        else:
-            print(
-                f"[fail] index={result.index:02d} "
-                f"elapsed={result.elapsed:.2f}s "
-                f"error={type(result.error).__name__}: {result.error}"
-            )

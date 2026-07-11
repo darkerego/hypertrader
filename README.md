@@ -247,7 +247,14 @@ Key options:
 
 ### `auto`
 
-Scans one coin or the top perp markets using TA-Lib signals from:
+`auto` now supports selectable strategies:
+
+- `default`: the existing MACD/SAR/ADX/Bollinger auto trader and the implicit default when `--strategy` is omitted
+- `reversal`: a closed-candle trend-exhaustion, structure-break, and retest strategy
+
+The strategy selection changes the signal engine only. Shared sizing, risk controls, modify-order entry, market-fallback cleanup, hidden-order behavior, and bracket management still run through the same common auto execution path.
+
+The default strategy scans one coin or the top perp markets using TA-Lib signals from:
 
 - MACD
 - Parabolic SAR
@@ -262,6 +269,7 @@ python3 hypertrader.py auto [COIN] (--size SIZE | --size-pct SIZE_PCT) [options]
 
 Key options:
 
+- `--strategy {default,reversal}`
 - `--size` or `--size-pct`
 - `--top-markets`
 - `--intervals`
@@ -288,7 +296,6 @@ Key options:
 - `--take-profit-levels`
 - `--trailing-tp`
 - `--trailing-tp-trigger-level`
-- `--trailing-tp-remaining-levels`
 - `--trailing-tp-profit-pct`
 - `--entry-retries`
 - `--entry-repost-interval`
@@ -316,12 +323,63 @@ Key options:
 - `--session-max-loss`
 - `--session-giveback-pct`
 - `--risk-session-log`
-- `--ws-candles`
+- `--disable-ws-candles`
 - `--hide-orders` or `-ho`
 - `--testnet`
 - `--no-websocket`
 
 `auto` derives TP from Bollinger Bands unless `--take-profit-pct` overrides it. If TP is set and SL is omitted, SL defaults to half TP. Executions route through the same bracket-entry path used by `enter`.
+
+Reversal strategy notes:
+
+- All confirmations use closed candles only.
+- SAR alone never opens a trade.
+- A trade requires: prior trend, exhaustion, confirmed Williams-fractal structure break, then a confirmed retest.
+- Default reversal intervals are `--trend-interval 1h` and `--entry-interval 15m`.
+- Reversal entries build explicit entry, stop, and multi-target plans before handing execution to the shared auto engine.
+- Hidden-order mode still applies: `--hide-orders` keeps reversal TP/SL targets local until trigger conditions are met.
+
+Important reversal-specific options:
+
+- `--trend-interval`: higher timeframe used for prior-trend classification
+- `--entry-interval`: lower timeframe used for structure-break and retest confirmation
+- `--reversal-min-adx`: minimum higher-timeframe ADX required before a reversal setup is considered
+- `--reversal-exhaustion-score`: minimum exhaustion confirmations required before structure-break tracking starts
+- `--reversal-retest-timeout`: number of entry candles allowed for the retest to confirm before the setup expires
+- `--reversal-stop-atr-buffer`: ATR buffer added beyond the invalidation point when computing the stop
+- `--reversal-max-stop-atr`: caps the stop width in ATR terms
+- `--reversal-min-rr`: minimum reward-to-risk ratio required for a valid execution plan
+- `--reversal-tp1-r`, `--reversal-tp2-r`, `--reversal-tp3-r`: target distances in multiples of initial risk
+- `--reversal-tp1-pct`, `--reversal-tp2-pct`, `--reversal-runner-pct`: allocation percentages for the three reversal exits; they must sum to `100`
+- `--reversal-exit-on-sar-flip` / `--no-reversal-exit-on-sar-flip`: enable or disable SAR-flip managed exits after entry
+- `--reversal-min-ema50-slope`: minimum absolute higher-timeframe EMA slope required to qualify the prior trend
+
+Example single-coin reversal scan:
+
+```bash
+python3 hypertrader.py auto --strategy reversal \
+  BTC \
+  --size-pct 5 \
+  --trend-interval 1h \
+  --entry-interval 15m \
+  --reversal-min-adx 18 \
+  --reversal-exhaustion-score 2 \
+  --reversal-min-rr 1.8 \
+  --reversal-exit-on-sar-flip
+```
+
+Example top-market reversal scan:
+
+```bash
+python3 hypertrader.py auto --strategy reversal \
+  --top-markets 30 \
+  --size-pct 5 \
+  --trend-interval 1h \
+  --entry-interval 15m \
+  --scan-interval 30 \
+  --loop-after-trade \
+  --max-coin-trades-per-session 3
+```
 
 Additional `auto` parameter notes:
 

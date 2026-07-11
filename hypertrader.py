@@ -23,6 +23,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from strategies.registry import available_strategies
 
 from hyperliquid.info import Info
 
@@ -257,6 +258,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                  help="Percent of available collateral to use for sizing. Accepts 10, 10%%, or 0.10.")
     auto_parser.add_argument("--top-markets", type=int, default=10,
                              help="When auto coin is omitted, scan the top N perp markets by day notional volume. Default: 10.")
+    auto_parser.add_argument("--strategy", type=str, default="default", choices=available_strategies(),
+                             help="Auto strategy selection. Default: default.")
     auto_parser.add_argument("--intervals", type=str, default="1h,15m,5m,1m",
                              help="Comma/space separated intervals. Default: 1h,15m,5m,1m.")
     auto_parser.add_argument("--auto-periods", type=int, default=200,
@@ -363,6 +366,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Disable ws for kline data (not recommended): ")
     auto_parser.add_argument("--hide-orders", "-ho", action="store_true",
                              help="Keep auto-mode TP/SL targets private; no exchange-side bracket orders are placed until targets trigger.")
+    reversal_group = auto_parser.add_argument_group("Reversal strategy")
+    reversal_group.add_argument("--trend-interval", type=str, default="1h",
+                                help="Higher timeframe used for reversal trend classification. Default: 1h.")
+    reversal_group.add_argument("--entry-interval", type=str, default="15m",
+                                help="Entry timeframe used for reversal structure-break and retest logic. Default: 15m.")
+    reversal_group.add_argument("--reversal-ema-fast", type=int, default=9)
+    reversal_group.add_argument("--reversal-ema-confirm", type=int, default=21)
+    reversal_group.add_argument("--reversal-ema-trend-fast", type=int, default=20)
+    reversal_group.add_argument("--reversal-ema-trend-slow", type=int, default=50)
+    reversal_group.add_argument("--reversal-rsi-period", type=int, default=14)
+    reversal_group.add_argument("--reversal-adx-period", type=int, default=14)
+    reversal_group.add_argument("--reversal-min-adx", type=float, default=18.0)
+    reversal_group.add_argument("--reversal-atr-period", type=int, default=14)
+    reversal_group.add_argument("--reversal-fractal-width", type=int, default=2)
+    reversal_group.add_argument("--reversal-exhaustion-score", type=int, default=2)
+    reversal_group.add_argument("--reversal-divergence-lookback", type=int, default=60)
+    reversal_group.add_argument("--reversal-min-swing-separation", type=int, default=5)
+    reversal_group.add_argument("--reversal-max-swing-separation", type=int, default=50)
+    reversal_group.add_argument("--reversal-min-rsi-divergence", type=float, default=2.0)
+    reversal_group.add_argument("--reversal-min-price-divergence-atr", type=float, default=0.05)
+    reversal_group.add_argument("--reversal-volume-climax-multiple", type=float, default=1.8)
+    reversal_group.add_argument("--reversal-extension-atr-multiple", type=float, default=1.8)
+    reversal_group.add_argument("--reversal-breakout-body-atr", type=float, default=0.30)
+    reversal_group.add_argument("--reversal-max-breakout-range-atr", type=float, default=2.50)
+    reversal_group.add_argument("--reversal-retest-timeout", type=int, default=8)
+    reversal_group.add_argument("--reversal-retest-atr-tolerance", type=float, default=0.15)
+    reversal_group.add_argument("--reversal-retest-min-price-pct", type=float, default=0.001)
+    reversal_group.add_argument("--reversal-stop-atr-buffer", type=float, default=0.25)
+    reversal_group.add_argument("--reversal-max-stop-atr", type=float, default=2.50)
+    reversal_group.add_argument("--reversal-min-rr", type=float, default=1.80)
+    reversal_group.add_argument("--reversal-tp1-r", type=float, default=1.0)
+    reversal_group.add_argument("--reversal-tp2-r", type=float, default=2.0)
+    reversal_group.add_argument("--reversal-tp3-r", type=float, default=3.0)
+    reversal_group.add_argument("--reversal-tp1-pct", type=float, default=35.0)
+    reversal_group.add_argument("--reversal-tp2-pct", type=float, default=35.0)
+    reversal_group.add_argument("--reversal-runner-pct", type=float, default=30.0)
+    reversal_group.add_argument("--reversal-min-ema50-slope", type=float, default=0.0005)
+    reversal_exit_group = reversal_group.add_mutually_exclusive_group()
+    reversal_exit_group.add_argument("--reversal-exit-on-sar-flip", dest="reversal_exit_on_sar_flip", action="store_true")
+    reversal_exit_group.add_argument("--no-reversal-exit-on-sar-flip", dest="reversal_exit_on_sar_flip", action="store_false")
+    auto_parser.set_defaults(reversal_exit_on_sar_flip=True)
 
     mm_parser = subparsers.add_parser(
         "market_maker",
@@ -620,9 +664,60 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         if args.ws_candles and args.no_websocket:
             print("[ERROR] --ws-candles requires websocket market data; remove --no-websocket.")
             sys.exit(1)
+        if args.strategy == "reversal":
+            if args.trend_interval not in INTERVAL_TO_MS:
+                print(f"[ERROR] Unsupported --trend-interval {args.trend_interval!r}.")
+                sys.exit(1)
+            if args.entry_interval not in INTERVAL_TO_MS:
+                print(f"[ERROR] Unsupported --entry-interval {args.entry_interval!r}.")
+                sys.exit(1)
+            if INTERVAL_TO_MS[args.entry_interval] >= INTERVAL_TO_MS[args.trend_interval]:
+                print("[ERROR] --entry-interval must be shorter than --trend-interval for reversal strategy.")
+                sys.exit(1)
+            if any(value <= 0 for value in (
+                args.reversal_ema_fast,
+                args.reversal_ema_confirm,
+                args.reversal_ema_trend_fast,
+                args.reversal_ema_trend_slow,
+                args.reversal_rsi_period,
+                args.reversal_adx_period,
+                args.reversal_atr_period,
+                args.reversal_fractal_width,
+                args.reversal_exhaustion_score,
+                args.reversal_divergence_lookback,
+                args.reversal_min_swing_separation,
+                args.reversal_max_swing_separation,
+                args.reversal_retest_timeout,
+            )):
+                print("[ERROR] Reversal periods, widths, and lookbacks must be > 0.")
+                sys.exit(1)
+            if args.reversal_min_swing_separation > args.reversal_max_swing_separation:
+                print("[ERROR] --reversal-min-swing-separation cannot exceed --reversal-max-swing-separation.")
+                sys.exit(1)
+            if any(value <= 0.0 for value in (
+                args.reversal_min_adx,
+                args.reversal_volume_climax_multiple,
+                args.reversal_extension_atr_multiple,
+                args.reversal_breakout_body_atr,
+                args.reversal_max_breakout_range_atr,
+                args.reversal_retest_atr_tolerance,
+                args.reversal_retest_min_price_pct,
+                args.reversal_stop_atr_buffer,
+                args.reversal_max_stop_atr,
+                args.reversal_min_rr,
+                args.reversal_tp1_r,
+                args.reversal_tp2_r,
+                args.reversal_tp3_r,
+            )):
+                print("[ERROR] Reversal numeric thresholds and multipliers must be > 0.")
+                sys.exit(1)
+            if abs((args.reversal_tp1_pct + args.reversal_tp2_pct + args.reversal_runner_pct) - 100.0) > 1e-9:
+                print("[ERROR] Reversal TP percentages must total 100.")
+                sys.exit(1)
 
         await run_auto_trader(
             coin=(args.coin.upper() if args.coin is not None else None),
+            strategy_name=args.strategy,
             size=args.size,
             size_pct=args.size_pct,
             top_markets=args.top_markets,
@@ -681,6 +776,41 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             use_websocket_candles=args.ws_candles,
             hide_orders=args.hide_orders,
             risk_session_log=args.risk_session_log,
+            trend_interval=args.trend_interval,
+            entry_interval=args.entry_interval,
+            reversal_ema_fast=args.reversal_ema_fast,
+            reversal_ema_confirm=args.reversal_ema_confirm,
+            reversal_ema_trend_fast=args.reversal_ema_trend_fast,
+            reversal_ema_trend_slow=args.reversal_ema_trend_slow,
+            reversal_rsi_period=args.reversal_rsi_period,
+            reversal_adx_period=args.reversal_adx_period,
+            reversal_min_adx=args.reversal_min_adx,
+            reversal_atr_period=args.reversal_atr_period,
+            reversal_fractal_width=args.reversal_fractal_width,
+            reversal_exhaustion_score=args.reversal_exhaustion_score,
+            reversal_divergence_lookback=args.reversal_divergence_lookback,
+            reversal_min_swing_separation=args.reversal_min_swing_separation,
+            reversal_max_swing_separation=args.reversal_max_swing_separation,
+            reversal_min_rsi_divergence=args.reversal_min_rsi_divergence,
+            reversal_min_price_divergence_atr=args.reversal_min_price_divergence_atr,
+            reversal_volume_climax_multiple=args.reversal_volume_climax_multiple,
+            reversal_extension_atr_multiple=args.reversal_extension_atr_multiple,
+            reversal_breakout_body_atr=args.reversal_breakout_body_atr,
+            reversal_max_breakout_range_atr=args.reversal_max_breakout_range_atr,
+            reversal_retest_timeout=args.reversal_retest_timeout,
+            reversal_retest_atr_tolerance=args.reversal_retest_atr_tolerance,
+            reversal_retest_min_price_pct=args.reversal_retest_min_price_pct,
+            reversal_stop_atr_buffer=args.reversal_stop_atr_buffer,
+            reversal_max_stop_atr=args.reversal_max_stop_atr,
+            reversal_min_rr=args.reversal_min_rr,
+            reversal_tp1_r=args.reversal_tp1_r,
+            reversal_tp2_r=args.reversal_tp2_r,
+            reversal_tp3_r=args.reversal_tp3_r,
+            reversal_tp1_pct=args.reversal_tp1_pct,
+            reversal_tp2_pct=args.reversal_tp2_pct,
+            reversal_runner_pct=args.reversal_runner_pct,
+            reversal_exit_on_sar_flip=args.reversal_exit_on_sar_flip,
+            reversal_min_ema50_slope=args.reversal_min_ema50_slope,
         )
         return
 

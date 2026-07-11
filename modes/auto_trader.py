@@ -5,14 +5,18 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Optional, List, Dict, Any, Tuple
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
 from modes.position_management import run_bracket_entry
-from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, cp
+from strategies.base import AutoStrategy, StrategyContext, StrategySignal
+from strategies.registry import create_strategy
+from strategies.reversal import normalize_signal_prices
+from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, PRICE_EPS, cp
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
@@ -190,7 +194,8 @@ class AutoScanLoopSnapshot:
 class AutoScanCandidate:
     """Outcome of scanning one market during a shared scan pass."""
     coin: str
-    decision: Optional["AutoTradeDecision"]
+    signal: Optional[StrategySignal]
+    strategy_context: Optional[StrategyContext]
     existing_position: Optional[Dict[str, Any]]
     rejection_reason: Optional[str] = None
 
@@ -205,6 +210,7 @@ class AutoManagedTradeResult:
     stop_loss_pct: Optional[float]
     started_ms: int
     closed_ms: int
+    log_context: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -341,6 +347,146 @@ class AutoStartupBackfillState:
             return 0
         completed_pairs = (self.successful_pairs or set()) | (self.ignored_pairs or set())
         return max(0, len(self.expected_pairs or set()) - len(completed_pairs))
+
+
+def _normalize_auto_log_value(value: Any) -> Any:
+    """Convert auto-trade context into JSON-safe primitive structures."""
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return round(value, 8) if math.isfinite(value) else str(value)
+    if isinstance(value, dict):
+        return {str(key): _normalize_auto_log_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_auto_log_value(item) for item in value]
+    return str(value)
+
+
+def _extract_quality_from_reason(reason: str) -> Optional[str]:
+    """Parse a `quality=` token from a structured strategy reason string."""
+    marker = "quality="
+    if marker not in reason:
+        return None
+    quality = reason.split(marker, 1)[1].strip().split()[0].strip("\"'")
+    return quality or None
+
+
+def _derive_auto_trade_quality(
+    strategy_name: str,
+    signal: StrategySignal,
+    strategy_context: StrategyContext,
+) -> str:
+    """Produce a compact quality label for structured auto-trade logging."""
+    metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+    explicit_quality = metadata.get("trade_quality")
+    if explicit_quality:
+        return str(explicit_quality)
+
+    bollinger_reason = ""
+    market_metadata = strategy_context.market_metadata if isinstance(strategy_context.market_metadata, dict) else {}
+    maybe_reason = market_metadata.get("bollinger_reason")
+    if maybe_reason is not None:
+        bollinger_reason = str(maybe_reason)
+    parsed_quality = _extract_quality_from_reason(bollinger_reason)
+    if parsed_quality:
+        return parsed_quality
+
+    if strategy_name == "default":
+        decision = metadata.get("decision") or market_metadata.get("default_decision")
+        if decision is not None:
+            long_votes = int(getattr(decision, "long_votes", 0) or 0)
+            short_votes = int(getattr(decision, "short_votes", 0) or 0)
+            required_votes = int(getattr(decision, "required_votes", 0) or 0)
+            snapshot_count = len(getattr(decision, "snapshots", []) or [])
+            winning_votes = max(long_votes, short_votes)
+            if snapshot_count > 0 and winning_votes >= snapshot_count and snapshot_count >= required_votes:
+                return "ideal"
+            if winning_votes > required_votes:
+                return "good"
+            if winning_votes == required_votes:
+                return "valid"
+        return "valid"
+
+    if strategy_name == "reversal":
+        expected_rr = metadata.get("expected_rr")
+        expected_rr_value = _try_float(expected_rr)
+        if expected_rr_value is not None:
+            if expected_rr_value >= 2.5:
+                return "ideal"
+            if expected_rr_value >= 2.0:
+                return "good"
+        if signal.score >= 2.0:
+            return "good"
+        return "valid"
+
+    return "unclassified"
+
+
+def _build_auto_trade_log_context(
+    strategy_name: str,
+    signal: StrategySignal,
+    strategy_context: StrategyContext,
+    plan: Any,
+    launch_size: float,
+) -> Dict[str, Any]:
+    """Build a structured launch-time snapshot for the auto-trade completion log."""
+    market_metadata = strategy_context.market_metadata if isinstance(strategy_context.market_metadata, dict) else {}
+    current_px = _try_float(market_metadata.get("current_px"))
+    default_decision = signal.metadata.get("decision") if isinstance(signal.metadata, dict) else None
+    if default_decision is None:
+        default_decision = market_metadata.get("default_decision")
+
+    indicator_values: Dict[str, Any]
+    if strategy_name == "default" and default_decision is not None:
+        snapshots = []
+        for snapshot in getattr(default_decision, "snapshots", []) or []:
+            snapshots.append(
+                {
+                    "interval": getattr(snapshot, "interval", None),
+                    "close": getattr(snapshot, "close", None),
+                    "direction": getattr(snapshot, "direction", None),
+                    "macd": getattr(snapshot, "macd", None),
+                    "macd_signal": getattr(snapshot, "macd_signal", None),
+                    "macd_hist": getattr(snapshot, "macd_hist", None),
+                    "sar": getattr(snapshot, "sar", None),
+                    "adx": getattr(snapshot, "adx", None),
+                    "bb_upper": getattr(snapshot, "bb_upper", None),
+                    "bb_middle": getattr(snapshot, "bb_middle", None),
+                    "bb_lower": getattr(snapshot, "bb_lower", None),
+                    "reason": getattr(snapshot, "reason", None),
+                }
+            )
+        indicator_values = {
+            "interval_snapshots": snapshots,
+            "bollinger_reason": market_metadata.get("bollinger_reason"),
+            "decision_reason": getattr(default_decision, "reason", None),
+            "long_votes": getattr(default_decision, "long_votes", None),
+            "short_votes": getattr(default_decision, "short_votes", None),
+            "required_votes": getattr(default_decision, "required_votes", None),
+        }
+    else:
+        indicator_values = {
+            "reasons": list(signal.reasons),
+            "metadata": dict(signal.metadata) if isinstance(signal.metadata, dict) else signal.metadata,
+        }
+
+    return _normalize_auto_log_value(
+        {
+            "strategy": strategy_name,
+            "trade_quality": _derive_auto_trade_quality(strategy_name, signal, strategy_context),
+            "signal_score": signal.score,
+            "entry_price": plan.expected_entry,
+            "signal_entry_price": signal.entry_price,
+            "size": launch_size,
+            "current_data": {
+                "current_px": current_px,
+                "signal_candle_ms": signal.signal_candle_ms,
+                "scan_time_ms": strategy_context.now_ms,
+                "reasons": list(signal.reasons),
+            },
+            "indicator_values": indicator_values,
+        }
+    )
 
 
 def now_ms() -> int:
@@ -1740,25 +1886,8 @@ def print_auto_decision(decision: AutoTradeDecision, instrument: str) -> None:
 async def scan_auto_trade_candidate(
     info: Info,
     scan_coin: str,
-    intervals: List[str],
-    periods: int,
-    min_agreement: int,
-    adx_threshold: float,
-    take_profit_pct: Optional[float],
-    stop_loss_pct: Optional[float],
-    min_take_profit_pct: float,
-    max_take_profit_pct: float,
-    macd_fast: int,
-    macd_slow: int,
-    macd_signal_period: int,
-    sar_acceleration: float,
-    sar_maximum: float,
-    adx_timeperiod: int,
-    bb_timeperiod: int,
-    bb_dev: float,
-    scalp: bool,
-    use_last_closed_candle: bool,
-    use_sar_stop_on_shortest_interval: bool,
+    strategy: AutoStrategy,
+    strategy_config: Any,
     snapshot: AutoScanLoopSnapshot,
     use_websocket_candles: bool = False,
     startup_backfill_state: Optional[AutoStartupBackfillState] = None,
@@ -1766,62 +1895,77 @@ async def scan_auto_trade_candidate(
     """Scan one market using shared loop snapshots to avoid redundant REST calls."""
     existing_pos = snapshot.positions_by_coin.get(scan_coin.upper())
     if existing_pos is not None:
-        return AutoScanCandidate(coin=scan_coin, decision=None, existing_position=existing_pos)
+        return AutoScanCandidate(coin=scan_coin, signal=None, strategy_context=None, existing_position=existing_pos)
 
-    decision = await evaluate_auto_trade_decision(
-        info=info,
+    interval_candles: Dict[str, List[Dict[str, Any]]] = {}
+    required_intervals: List[str]
+    if strategy.name == "reversal":
+        required_intervals = [str(strategy_config.trend_interval), str(strategy_config.entry_interval)]
+    else:
+        required_intervals = list(strategy_config.intervals)
+
+    for interval in required_intervals:
+        if startup_backfill_state is not None:
+            startup_backfill_state.register_pending(scan_coin, interval)
+        try:
+            candles = await fetch_recent_candles(
+                info,
+                scan_coin,
+                interval,
+                int(strategy_config.reversal_history_periods if strategy.name == "reversal" else strategy_config.periods),
+                use_websocket_candles=use_websocket_candles,
+            )
+        except Exception as exc:
+            if startup_backfill_state is not None:
+                if is_rate_limit_error(exc):
+                    startup_backfill_state.mark_rate_limit()
+                elif is_unknown_market_error(exc, scan_coin):
+                    startup_backfill_state.mark_market_unusable(scan_coin, str(exc))
+                else:
+                    startup_backfill_state.mark_non_rate_limit_failure(scan_coin, interval)
+            raise
+        else:
+            if startup_backfill_state is not None:
+                startup_backfill_state.mark_success(scan_coin, interval)
+            interval_candles[interval] = candles
+
+    strategy_context = StrategyContext(
         coin=scan_coin,
-        intervals=intervals,
-        periods=periods,
-        min_agreement=min_agreement,
-        adx_threshold=adx_threshold,
-        take_profit_pct_override=take_profit_pct,
-        stop_loss_pct_override=stop_loss_pct,
-        min_take_profit_pct=min_take_profit_pct,
-        max_take_profit_pct=max_take_profit_pct,
-        macd_fast=macd_fast,
-        macd_slow=macd_slow,
-        macd_signal_period=macd_signal_period,
-        sar_acceleration=sar_acceleration,
-        sar_maximum=sar_maximum,
-        adx_timeperiod=adx_timeperiod,
-        bb_timeperiod=bb_timeperiod,
-        bb_dev=bb_dev,
-        use_last_closed_candle=use_last_closed_candle,
-        use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
-        use_websocket_candles=use_websocket_candles,
-        current_px=snapshot.mids.get(scan_coin.upper()),
-        startup_backfill_state=startup_backfill_state,
+        now_ms=now_ms(),
+        config=strategy_config,
+        market_metadata={
+            "current_px": snapshot.mids.get(scan_coin.upper()),
+            "interval_candles": interval_candles,
+        },
+        trend_candles=interval_candles.get(getattr(strategy_config, "trend_interval", ""), []),
+        entry_candles=interval_candles.get(getattr(strategy_config, "entry_interval", ""), []),
+        current_position=None,
     )
-    print_auto_decision(decision, scan_coin)
+    signal = await strategy.evaluate(strategy_context)
+    if signal is None:
+        if strategy.name == "default":
+            decision = strategy_context.market_metadata.get("default_decision")
+            if decision is not None:
+                print_auto_decision(decision, scan_coin)
+                bb_reason = strategy_context.market_metadata.get("bollinger_reason")
+                if bb_reason:
+                    print(f"[BB] {scan_coin} {bb_reason}")
+        return AutoScanCandidate(coin=scan_coin, signal=None, strategy_context=strategy_context, existing_position=None)
 
-    if decision.direction is None or decision.take_profit_pct is None:
-        return AutoScanCandidate(coin=scan_coin, decision=decision, existing_position=None)
+    if strategy.name == "default":
+        decision = strategy_context.market_metadata.get("default_decision")
+        if decision is not None:
+            print_auto_decision(decision, scan_coin)
+            bb_reason = strategy_context.market_metadata.get("bollinger_reason")
+            if bb_reason:
+                print(f"[BB] {scan_coin} {bb_reason}")
 
-    interval_to_closes = {interval_snapshot.interval: list(interval_snapshot.closes) for interval_snapshot in decision.snapshots}
-    bb_allowed, bb_reason, _bb_states = confirm_signal_with_bollinger(
-        side=decision.direction,
-        interval_to_closes=interval_to_closes,
-        active_intervals=intervals,
-        scalp=scalp,
-        period=bb_timeperiod,
-        stddev_multiplier=bb_dev,
-    )
-    print(f"[BB] {scan_coin} {bb_reason}")
-    if not bb_allowed:
-        print(f"[AUTO] {scan_coin} Bollinger confirmation rejected; skipping entry this loop.")
-        return AutoScanCandidate(
-            coin=scan_coin,
-            decision=decision,
-            existing_position=None,
-            rejection_reason="bollinger_confirmation_rejected",
-        )
-
-    return AutoScanCandidate(coin=scan_coin, decision=decision, existing_position=None)
+    return AutoScanCandidate(coin=scan_coin, signal=signal, strategy_context=strategy_context, existing_position=None)
 
 
 async def run_auto_trader(
     coin: Optional[str],
+    strategy_name: str,
     size: Optional[float],
     size_pct: Optional[Any],
     top_markets: int,
@@ -1880,6 +2024,41 @@ async def run_auto_trader(
     use_websocket_candles: bool = False,
     hide_orders: bool = False,
     risk_session_log: str = "",
+    trend_interval: str = "1h",
+    entry_interval: str = "15m",
+    reversal_ema_fast: int = 9,
+    reversal_ema_confirm: int = 21,
+    reversal_ema_trend_fast: int = 20,
+    reversal_ema_trend_slow: int = 50,
+    reversal_rsi_period: int = 14,
+    reversal_adx_period: int = 14,
+    reversal_min_adx: float = 18.0,
+    reversal_atr_period: int = 14,
+    reversal_fractal_width: int = 2,
+    reversal_exhaustion_score: int = 2,
+    reversal_divergence_lookback: int = 60,
+    reversal_min_swing_separation: int = 5,
+    reversal_max_swing_separation: int = 50,
+    reversal_min_rsi_divergence: float = 2.0,
+    reversal_min_price_divergence_atr: float = 0.05,
+    reversal_volume_climax_multiple: float = 1.8,
+    reversal_extension_atr_multiple: float = 1.8,
+    reversal_breakout_body_atr: float = 0.30,
+    reversal_max_breakout_range_atr: float = 2.50,
+    reversal_retest_timeout: int = 8,
+    reversal_retest_atr_tolerance: float = 0.15,
+    reversal_retest_min_price_pct: float = 0.001,
+    reversal_stop_atr_buffer: float = 0.25,
+    reversal_max_stop_atr: float = 2.50,
+    reversal_min_rr: float = 1.80,
+    reversal_tp1_r: float = 1.0,
+    reversal_tp2_r: float = 2.0,
+    reversal_tp3_r: float = 3.0,
+    reversal_tp1_pct: float = 35.0,
+    reversal_tp2_pct: float = 35.0,
+    reversal_runner_pct: float = 30.0,
+    reversal_exit_on_sar_flip: bool = True,
+    reversal_min_ema50_slope: float = 0.0005,
     account_address: Optional[str] = None,
     info: Optional[Info] = None,
     exchange: Optional[Exchange] = None,
@@ -1966,6 +2145,65 @@ async def run_auto_trader(
     _iter = 0
     auto_trades_logger = get_auto_trades_logger()
     startup_backfill_state = AutoStartupBackfillState(enabled=True)
+    strategy_config = SimpleNamespace(
+        strategy_name=strategy_name,
+        intervals=intervals,
+        periods=periods,
+        min_agreement=min_agreement,
+        adx_threshold=adx_threshold,
+        take_profit_pct=take_profit_pct,
+        stop_loss_pct=stop_loss_pct,
+        min_take_profit_pct=min_take_profit_pct,
+        max_take_profit_pct=max_take_profit_pct,
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal_period=macd_signal_period,
+        sar_acceleration=sar_acceleration,
+        sar_maximum=sar_maximum,
+        adx_timeperiod=adx_timeperiod,
+        bb_timeperiod=bb_timeperiod,
+        bb_dev=bb_dev,
+        scalp=scalp,
+        use_last_closed_candle=use_last_closed_candle,
+        use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
+        trend_interval=trend_interval,
+        entry_interval=entry_interval,
+        reversal_ema_fast=reversal_ema_fast,
+        reversal_ema_confirm=reversal_ema_confirm,
+        reversal_ema_trend_fast=reversal_ema_trend_fast,
+        reversal_ema_trend_slow=reversal_ema_trend_slow,
+        reversal_rsi_period=reversal_rsi_period,
+        reversal_adx_period=reversal_adx_period,
+        reversal_min_adx=reversal_min_adx,
+        reversal_atr_period=reversal_atr_period,
+        reversal_fractal_width=reversal_fractal_width,
+        reversal_exhaustion_score=reversal_exhaustion_score,
+        reversal_divergence_lookback=reversal_divergence_lookback,
+        reversal_min_swing_separation=reversal_min_swing_separation,
+        reversal_max_swing_separation=reversal_max_swing_separation,
+        reversal_min_rsi_divergence=reversal_min_rsi_divergence,
+        reversal_min_price_divergence_atr=reversal_min_price_divergence_atr,
+        reversal_volume_climax_multiple=reversal_volume_climax_multiple,
+        reversal_extension_atr_multiple=reversal_extension_atr_multiple,
+        reversal_breakout_body_atr=reversal_breakout_body_atr,
+        reversal_max_breakout_range_atr=reversal_max_breakout_range_atr,
+        reversal_retest_timeout=reversal_retest_timeout,
+        reversal_retest_atr_tolerance=reversal_retest_atr_tolerance,
+        reversal_retest_min_price_pct=reversal_retest_min_price_pct,
+        reversal_stop_atr_buffer=reversal_stop_atr_buffer,
+        reversal_max_stop_atr=reversal_max_stop_atr,
+        reversal_min_rr=reversal_min_rr,
+        reversal_tp1_r=reversal_tp1_r,
+        reversal_tp2_r=reversal_tp2_r,
+        reversal_tp3_r=reversal_tp3_r,
+        reversal_tp1_pct=reversal_tp1_pct,
+        reversal_tp2_pct=reversal_tp2_pct,
+        reversal_runner_pct=reversal_runner_pct,
+        reversal_exit_on_sar_flip=reversal_exit_on_sar_flip,
+        reversal_min_ema50_slope=reversal_min_ema50_slope,
+        reversal_history_periods=max(300, periods),
+    )
+    strategy = create_strategy(strategy_name, strategy_config)
 
     try:
         if owns_clients:
@@ -1983,6 +2221,7 @@ async def run_auto_trader(
         print(f"Network:            {'TESTNET' if use_testnet else 'MAINNET'}")
         print(f"Websocket:          {'ENABLED' if use_websocket else 'DISABLED'}")
         print(f"WS candles:         {'ENABLED' if use_websocket_candles else 'DISABLED'}")
+        print(f"Strategy:           {strategy.name}")
         print(f"Hide orders:        {hide_orders}")
         print(f"Coin scope:         {coin if coin is not None else f'TOP {top_markets} PERPS BY VOLUME'}")
         print(f"Size mode:          {'fixed contracts' if size is not None else 'available collateral pct'}")
@@ -2027,6 +2266,7 @@ async def run_auto_trader(
             managed_sl_pct: Optional[float],
             managed_sl_trigger_px: Optional[float],
             managed_shortest_snapshot: Optional[AutoIntervalSignal],
+            managed_log_context: Optional[Dict[str, Any]] = None,
         ) -> AutoManagedTradeResult:
             trade_cycle_started_ms = now_ms()
             await run_bracket_entry(
@@ -2076,6 +2316,7 @@ async def run_auto_trader(
                 stop_loss_pct=managed_sl_pct,
                 started_ms=trade_cycle_started_ms,
                 closed_ms=now_ms(),
+                log_context=dict(managed_log_context or {}),
             )
 
         async def _drain_completed_trade_tasks() -> None:
@@ -2094,15 +2335,21 @@ async def run_auto_trader(
                     continue
 
                 completed_trades += 1
-                auto_trades_logger.info(
-                    "[AUTO-TRADE-COMPLETE] coin=%s direction=%s size=%.8f tp_pct=%.8f sl_pct=%s completed_trades=%d",
-                    trade_result.coin,
-                    trade_result.direction,
-                    trade_result.size,
-                    trade_result.take_profit_pct,
-                    f"{trade_result.stop_loss_pct:.8f}" if trade_result.stop_loss_pct is not None else "N/A",
-                    completed_trades,
+                auto_trade_log_payload = _normalize_auto_log_value(
+                    {
+                        "event": "auto_trade_complete",
+                        "coin": trade_result.coin,
+                        "direction": trade_result.direction,
+                        "size": trade_result.size,
+                        "take_profit_pct": trade_result.take_profit_pct,
+                        "stop_loss_pct": trade_result.stop_loss_pct,
+                        "completed_trades": completed_trades,
+                        "started_ms": trade_result.started_ms,
+                        "closed_ms": trade_result.closed_ms,
+                        "signal_snapshot": trade_result.log_context,
+                    }
                 )
+                auto_trades_logger.info(json.dumps(auto_trade_log_payload, sort_keys=True))
 
                 if info is None or exchange is None:
                     raise RuntimeError("Initialized clients became unavailable while draining auto trade tasks.")
@@ -2317,7 +2564,8 @@ async def run_auto_trader(
                     await asyncio.sleep(scan_interval)
                     continue
 
-            startup_backfill_state.set_expected_pairs(eligible_scan_coins, intervals)
+            strategy_intervals = [trend_interval, entry_interval] if strategy.name == "reversal" else intervals
+            startup_backfill_state.set_expected_pairs(eligible_scan_coins, strategy_intervals)
             startup_backfill_state.begin_iteration()
 
             shared_snapshot = await build_auto_scan_loop_snapshot(
@@ -2344,32 +2592,15 @@ async def run_auto_trader(
                     return await scan_auto_trade_candidate(
                         info=info,
                         scan_coin=scan_coin,
-                        intervals=intervals,
-                        periods=periods,
-                        min_agreement=min_agreement,
-                        adx_threshold=adx_threshold,
-                        take_profit_pct=take_profit_pct,
-                        stop_loss_pct=stop_loss_pct,
-                        min_take_profit_pct=min_take_profit_pct,
-                        max_take_profit_pct=max_take_profit_pct,
-                        macd_fast=macd_fast,
-                        macd_slow=macd_slow,
-                        macd_signal_period=macd_signal_period,
-                        sar_acceleration=sar_acceleration,
-                        sar_maximum=sar_maximum,
-                        adx_timeperiod=adx_timeperiod,
-                        bb_timeperiod=bb_timeperiod,
-                        bb_dev=bb_dev,
-                        scalp=scalp,
-                        use_last_closed_candle=use_last_closed_candle,
-                        use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
+                        strategy=strategy,
+                        strategy_config=strategy_config,
                         snapshot=shared_snapshot,
                         use_websocket_candles=use_websocket_candles,
                         startup_backfill_state=startup_backfill_state,
                     )
 
             scan_tasks = [asyncio.create_task(_scan_with_limit(scan_coin)) for scan_coin in eligible_scan_coins]
-            launch_specs: List[Tuple[str, AutoTradeDecision, float]] = []
+            launch_specs: List[Tuple[str, StrategySignal, StrategyContext, float]] = []
             try:
                 for completed_task in asyncio.as_completed(scan_tasks):
                     try:
@@ -2390,7 +2621,7 @@ async def run_auto_trader(
                         )
                         continue
 
-                    if candidate.decision is None or candidate.decision.direction is None or candidate.decision.take_profit_pct is None:
+                    if candidate.signal is None or candidate.strategy_context is None:
                         continue
                     if candidate.coin in reserved_coins:
                         print(
@@ -2412,7 +2643,7 @@ async def run_auto_trader(
                         print(f"[AUTO-WARN] {candidate.coin} size resolution failed; skipping trade candidate: {exc}")
                         continue
                     print(f"[AUTO] {candidate.coin} size resolved to {resolved_size:.8f} ({size_reason})")
-                    launch_specs.append((candidate.coin, candidate.decision, resolved_size))
+                    launch_specs.append((candidate.coin, candidate.signal, candidate.strategy_context, resolved_size))
                     reserved_coins.add(candidate.coin)
                     if len(launch_specs) >= available_slots:
                         print(
@@ -2426,6 +2657,11 @@ async def run_auto_trader(
 
             await asyncio.gather(*scan_tasks, return_exceptions=True)
             startup_backfill_state.finish_iteration()
+
+            launch_specs.sort(
+                key=lambda item: strategy.rank_signal(item[1]),
+                reverse=True,
+            )
 
             if startup_backfill_state.enabled and not startup_backfill_state.complete:
                 print(
@@ -2442,40 +2678,88 @@ async def run_auto_trader(
                 continue
 
             if dry_run:
-                for launch_coin, _launch_decision, _launch_size in launch_specs:
-                    print(f"[AUTO] Dry run enabled; {launch_coin} signal will not be traded.")
+                for launch_coin, launch_signal, _launch_context, _launch_size in launch_specs:
+                    print(
+                        f"[AUTO] Dry run enabled; {launch_coin} {launch_signal.strategy} "
+                        f"{launch_signal.direction.upper()} signal will not be traded."
+                    )
                 await _sleep_until_next_scan_batch()
                 continue
 
-            for launch_coin, launch_decision, launch_size in launch_specs:
-                direction = launch_decision.direction
-                if direction is None or launch_decision.take_profit_pct is None:
-                    continue
-                auto_tp_pct = launch_decision.take_profit_pct
-                auto_sl_pct = stop_loss_pct if stop_loss_pct is not None else launch_decision.stop_loss_pct
-                auto_sl_trigger_px = (
-                    launch_decision.stop_loss_trigger_px
-                    if use_sar_stop_on_shortest_interval
-                    else None
-                )
-                shortest_snapshot = get_shortest_interval_snapshot(launch_decision.snapshots)
-                sl_display = f"{auto_sl_pct * 100:.4f}%" if auto_sl_pct is not None else "N/A"
-                print(
-                    f"[AUTO] Launching managed task for {direction.upper()} {launch_coin}: size={launch_size:.8f}, "
-                    f"tp_pct={auto_tp_pct * 100:.4f}%, sl_pct={sl_display}, "
-                    f"sl_trigger={f'{auto_sl_trigger_px:.8f}' if auto_sl_trigger_px is not None else 'N/A'}"
-                )
-                active_trade_tasks[launch_coin] = asyncio.create_task(
-                    _run_managed_auto_trade(
-                        managed_coin=launch_coin,
-                        managed_direction=direction,
-                        managed_size=launch_size,
-                        managed_tp_pct=auto_tp_pct,
-                        managed_sl_pct=auto_sl_pct,
-                        managed_sl_trigger_px=auto_sl_trigger_px,
-                        managed_shortest_snapshot=shortest_snapshot,
+            for launch_coin, launch_signal, launch_context, launch_size in launch_specs:
+                if launch_signal.strategy == "reversal":
+                    launch_signal = await normalize_signal_prices(info, launch_signal)
+                plan = strategy.build_execution_plan(launch_context, launch_signal, launch_size)
+                if plan.kind == "bracket_entry":
+                    auto_tp_pct = float(plan.metadata["take_profit_pct"])
+                    auto_sl_pct = plan.metadata.get("stop_loss_pct")
+                    auto_sl_trigger_px = (
+                        plan.metadata.get("stop_loss_trigger_px")
+                        if use_sar_stop_on_shortest_interval
+                        else None
                     )
-                )
+                    sl_display = f"{auto_sl_pct * 100:.4f}%" if auto_sl_pct is not None else "N/A"
+                    print(
+                        f"[AUTO] Launching managed task for {plan.direction.upper()} {launch_coin}: size={launch_size:.8f}, "
+                        f"tp_pct={auto_tp_pct * 100:.4f}%, sl_pct={sl_display}, "
+                        f"sl_trigger={f'{auto_sl_trigger_px:.8f}' if auto_sl_trigger_px is not None else 'N/A'}"
+                    )
+                    log_context = _build_auto_trade_log_context(
+                        strategy_name=launch_signal.strategy,
+                        signal=launch_signal,
+                        strategy_context=launch_context,
+                        plan=plan,
+                        launch_size=launch_size,
+                    )
+                    active_trade_tasks[launch_coin] = asyncio.create_task(
+                        _run_managed_auto_trade(
+                            managed_coin=launch_coin,
+                            managed_direction=plan.direction,
+                            managed_size=launch_size,
+                            managed_tp_pct=auto_tp_pct,
+                            managed_sl_pct=auto_sl_pct,
+                            managed_sl_trigger_px=auto_sl_trigger_px,
+                            managed_shortest_snapshot=(
+                                SimpleNamespace(interval=plan.metadata.get("shortest_interval"))
+                                if plan.metadata.get("shortest_interval")
+                                else None
+                            ),
+                            managed_log_context=log_context,
+                        )
+                    )
+                else:
+                    # Reversal currently routes through the same guarded bracket-entry execution path.
+                    tp3 = plan.take_profit_prices[-1]
+                    if plan.direction == "long":
+                        take_profit_fraction = max(PRICE_EPS, (tp3 - plan.expected_entry) / plan.expected_entry)
+                        stop_loss_fraction = max(PRICE_EPS, (plan.expected_entry - plan.stop_price) / plan.expected_entry)
+                    else:
+                        take_profit_fraction = max(PRICE_EPS, (plan.expected_entry - tp3) / plan.expected_entry)
+                        stop_loss_fraction = max(PRICE_EPS, (plan.stop_price - plan.expected_entry) / plan.expected_entry)
+                    print(
+                        f"[AUTO] Launching reversal managed task for {plan.direction.upper()} {launch_coin}: "
+                        f"size={launch_size:.8f}, entry={plan.expected_entry:.8f}, stop={plan.stop_price:.8f}, "
+                        f"tp1={plan.take_profit_prices[0]:.8f}, tp2={plan.take_profit_prices[1]:.8f}, tp3={tp3:.8f}"
+                    )
+                    log_context = _build_auto_trade_log_context(
+                        strategy_name=launch_signal.strategy,
+                        signal=launch_signal,
+                        strategy_context=launch_context,
+                        plan=plan,
+                        launch_size=launch_size,
+                    )
+                    active_trade_tasks[launch_coin] = asyncio.create_task(
+                        _run_managed_auto_trade(
+                            managed_coin=launch_coin,
+                            managed_direction=plan.direction,
+                            managed_size=launch_size,
+                            managed_tp_pct=take_profit_fraction,
+                            managed_sl_pct=stop_loss_fraction,
+                            managed_sl_trigger_px=plan.stop_price,
+                            managed_shortest_snapshot=None,
+                            managed_log_context=log_context,
+                        )
+                    )
 
             metrics_start_time_ms = int(time.time() * 1000)
             await _sleep_until_next_scan_batch()

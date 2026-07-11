@@ -1,3 +1,23 @@
+# 2026-07-10 22:59:15 EDT
+
+- Updated `README.md` so the new auto strategy functionality is documented more completely: the shared execution-path behavior for all strategies is now explicit, and the `reversal` strategy section now covers the main reversal-only CLI parameters and trade-planning behavior.
+
+# 2026-07-10 20:27:54 EDT
+
+- Updated `modes/auto_trader.py` so the `reversal` auto strategy now excludes unknown/non-functional markets from startup candle backfill tracking the same way the default strategy already does.
+- Prevented reversal auto runs from staying stuck behind `[AUTO] Startup candle backfill still in progress` when a top-volume market has no usable candle feed and would otherwise leave its startup coin/interval pairs permanently incomplete.
+
+# 2026-07-10 16:16:18 EDT
+
+- Updated `modes/auto_trader.py` auto-trade completion logging so each completed auto trade now writes a structured payload containing the launch-time trade quality label, expected entry price, current market snapshot, and strategy indicator/context values alongside the existing coin/side/size/TP/SL metadata.
+- Preserved the existing completion-time logging point by capturing the signal snapshot when the managed task is launched and carrying that context through the background trade lifecycle until the trade closes.
+
+# 2026-07-10 16:03:13 EDT
+
+- Added a new top-level `strategies/` package with a typed strategy contract, deterministic registry, extracted `default` auto strategy, and a new `reversal` auto strategy module.
+- Updated `hypertrader.py` and `modes/auto_trader.py` so `auto` now accepts `--strategy {default,reversal}`, logs the selected strategy at startup, instantiates the strategy once per auto session, and keeps shared scan/sizing/risk/execution infrastructure outside the strategy implementations.
+- Added reversal-strategy CLI parameters, reversal helper tests, registry/parser tests, and README documentation for the new strategy selection and reversal workflow.
+
 # 2026-07-09 22:56:00 EDT
 
 - Extended `utils/helpers.py` websocket cache coverage with a first-pass hybrid account cache: `user_state` / `clearinghouseState`, `openOrders`, `frontendOpenOrders`, and `userFills` are now cached in memory, with `userEvents`, `userFills`, and `orderUpdates` marking REST-backed snapshots dirty and websocket fills incrementally merged into the session fill cache.
@@ -121,3 +141,9 @@
 
 - Updated auto-mode SAR stop handling in `modes/position_management.py` so a live Parabolic SAR flip now exits the remaining position immediately: long positions close when the latest SAR is above or equal to the latest close, and short positions close when the latest SAR is below or equal to the latest close.
 - Preserved the existing dynamic SAR stop-price refresh behavior when the SAR dot remains on the protective side, so auto-managed positions still ratchet their stop trigger without changing non-auto bracket behavior.
+
+# 2026-07-10 16:38:25 EDT
+
+- Added `async_hyperliquid.py` with a standalone `AsyncHyperliquid` client that extracts reusable Hyperliquid exchange, account-state, websocket cache, market-data, candles, order placement, position sizing, fill waiting, position closing, account monitoring, and take-profit ladder logic out of the bot into a strategy-independent async library.
+- Added `tests/test_async_hyperliquid.py` with fake async SDK coverage for initialization, websocket callback bridging, cache/REST fallback behavior, rounding, order normalization, chase-entry behavior, market-close guards, candle streaming, fill waiters, TP reconciliation, retries, read-only safety, and shutdown behavior.
+- Validation in this environment: `python3 -m py_compile hypertrader.py` passed, `python3 -m compileall async_hyperliquid.py tests/test_async_hyperliquid.py` passed, `.venv/bin/python hypertrader.py --help` passed, `.venv/bin/python hypertrader.py enter --help` passed, and a manual fake-SDK smoke run of `AsyncHyperliquid.initialize()`, `get_account_balance()`, `get_mid()`, and `place_limit_order()` passed. `pytest`, `pytest-asyncio`, `ruff`, and `mypy` are not installed here, so those requested validation commands could not be executed.
