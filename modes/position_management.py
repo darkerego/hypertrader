@@ -6,7 +6,9 @@ from typing import Optional, List, Dict, Any, Tuple
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
-from utils.helpers import compute_default_stop_loss_pct, get_open_orders_for_coin
+from utils.helpers import compute_default_stop_loss_pct, get_open_orders_for_coin, \
+    hyperliquid_market_ids_match, normalize_hyperliquid_market_id, split_hyperliquid_market_id, \
+    _info_method_with_optional_dex
 from utils.constants import WATCH_RETRY_SLEEP_SECONDS, PRICE_EPS
 from utils.helpers import init_clients, get_position_for_coin, \
     parse_position_snapshot, get_all_mids, compute_position_unrealized_pnl, get_account_runtime_metrics, \
@@ -64,10 +66,18 @@ async def get_frontend_open_orders_for_coin(
     try:
         cache = get_ws_cache(info)
         if cache is not None and not force_http:
-            cached_orders = await cache.get_frontend_open_orders(force_refresh=False)
-            orders = cached_orders if cached_orders is not None else await info.frontend_open_orders(account_address)
+            normalized_coin = normalize_hyperliquid_market_id(coin)
+            dex, _ = split_hyperliquid_market_id(normalized_coin)
+            cached_orders = await cache.get_frontend_open_orders(force_refresh=False) if not dex else None
+            orders = (
+                cached_orders
+                if cached_orders is not None
+                else await _info_method_with_optional_dex(info, "frontend_open_orders", account_address, dex=dex)
+            )
         else:
-            orders = await info.frontend_open_orders(account_address)
+            normalized_coin = normalize_hyperliquid_market_id(coin)
+            dex, _ = split_hyperliquid_market_id(normalized_coin)
+            orders = await _info_method_with_optional_dex(info, "frontend_open_orders", account_address, dex=dex)
     except Exception:
         logging.getLogger("hypertrader").exception(
             "[WARN] Failed to fetch frontend open orders for %s.",
@@ -78,7 +88,7 @@ async def get_frontend_open_orders_for_coin(
     out: List[Dict[str, Any]] = []
     for order in orders:
         try:
-            if str(order.get("coin", "")).lower() == coin.lower():
+            if hyperliquid_market_ids_match(str(order.get("coin", "")), normalized_coin):
                 out.append(order)
         except Exception:
             continue
@@ -1885,7 +1895,7 @@ async def run_bracket_entry(
         if owns_clients:
             account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
         metrics_start_time_ms = int(time.time() * 1000)
-        coin = coin.upper()
+        coin = normalize_hyperliquid_market_id(coin)
         is_buy = direction == "long"
 
         print("============================================================")

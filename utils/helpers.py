@@ -19,6 +19,63 @@ from utils.worker import AsyncTaskQueue
 decimal.getcontext().prec = 4
 
 
+def normalize_hyperliquid_market_id(coin: str) -> str:
+    """Normalize a market id, preserving optional dex-qualified perps."""
+    raw = str(coin).strip()
+    if not raw:
+        return ""
+    if ":" not in raw:
+        return raw.upper()
+    dex, symbol = raw.split(":", 1)
+    dex = dex.strip().upper()
+    symbol = symbol.strip().upper()
+    return f"{dex}:{symbol}" if dex else symbol
+
+
+def split_hyperliquid_market_id(coin: str) -> Tuple[str, str]:
+    """Return ``(dex, symbol)`` for native or HIP-3 perp identifiers."""
+    normalized = normalize_hyperliquid_market_id(coin)
+    if ":" not in normalized:
+        return "", normalized
+    dex, symbol = normalized.split(":", 1)
+    return dex, symbol
+
+
+def hyperliquid_market_ids_match(left: str, right: str) -> bool:
+    """Case-insensitive market-id comparison with consistent dex handling."""
+    return normalize_hyperliquid_market_id(left) == normalize_hyperliquid_market_id(right)
+
+
+async def _info_method_with_optional_dex(info: Info, method_name: str, *args: Any, dex: str = "") -> Any:
+    """Call an Info method, tolerating SDK revisions with or without ``dex`` support."""
+    method = getattr(info, method_name)
+    if not dex:
+        return await method(*args)
+    try:
+        return await method(*args, dex=dex)
+    except TypeError:
+        return await method(*args, dex)
+
+
+async def _info_meta_with_optional_dex(info: Info, dex: str = "") -> Any:
+    """Fetch market metadata, trying dex-aware SDK variants first when needed."""
+    if not dex:
+        return await info.meta()
+    try:
+        return await info.meta(dex=dex)
+    except TypeError:
+        return await info.meta(dex)
+
+
+async def post_active_asset_data(info: Info, account_address: str, coin: str) -> Any:
+    """Fetch ``activeAssetData`` for native or dex-qualified perp markets."""
+    dex, symbol = split_hyperliquid_market_id(coin)
+    payload: Dict[str, Any] = {"type": "activeAssetData", "user": account_address, "coin": symbol}
+    if dex:
+        payload["dex"] = dex
+    return await info.post("/info", payload)
+
+
 
 
 
@@ -686,10 +743,17 @@ def _try_float(value: Any) -> Optional[float]:
 
 async def get_asset_id(info: Info, coin: str) -> int:
     """Return Hyperliquid asset id for a coin/symbol name."""
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     try:
-        return int(await info.name_to_asset(coin))  # type: ignore[attr-defined]
+        return int(await info.name_to_asset(normalized_coin))  # type: ignore[attr-defined]
     except Exception as exc:
-        raise RuntimeError(f"Could not resolve Hyperliquid asset id for {coin}: {exc}") from exc
+        dex, symbol = split_hyperliquid_market_id(normalized_coin)
+        if dex:
+            try:
+                return int(await info.name_to_asset(symbol))  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        raise RuntimeError(f"Could not resolve Hyperliquid asset id for {normalized_coin}: {exc}") from exc
 
 
 async def get_size_decimals(info: Info, coin: str) -> int:
@@ -797,25 +861,31 @@ async def get_open_orders_for_coin(
         force_http: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return open orders for a specific coin."""
+    normalized_coin = normalize_hyperliquid_market_id(coin)
+    dex, _ = split_hyperliquid_market_id(normalized_coin)
     try:
         open_orders: Any
         cache = get_ws_cache(info)
-        if cache is not None and not force_http:
+        if cache is not None and not force_http and not dex:
             cached_orders = await cache.get_open_orders(force_refresh=False)
-            open_orders = cached_orders if cached_orders is not None else await info.open_orders(account_address)
+            open_orders = (
+                cached_orders
+                if cached_orders is not None
+                else await _info_method_with_optional_dex(info, "open_orders", account_address, dex=dex)
+            )
         else:
-            open_orders = await info.open_orders(account_address)
+            open_orders = await _info_method_with_optional_dex(info, "open_orders", account_address, dex=dex)
     except Exception:
         logging.getLogger("hypertrader").exception(
             "[WARN] Failed to fetch open orders for %s.",
-            coin,
+            normalized_coin,
         )
         return []
 
     coin_orders: List[Dict[str, Any]] = []
     for order in open_orders:
         try:
-            if str(order.get("coin", "")).lower() == coin.lower():
+            if hyperliquid_market_ids_match(str(order.get("coin", "")), normalized_coin):
                 coin_orders.append(order)
         except Exception:
             continue
@@ -846,17 +916,23 @@ async def get_user_state_with_retry(
         force_http: bool = False,
 ) -> Dict[str, Any]:
     """Fetch user_state and keep retrying on Hyperliquid rate limits."""
-    coin_label = coin.upper() if coin else "ALL"
+    normalized_coin = normalize_hyperliquid_market_id(coin) if coin else None
+    dex, _ = split_hyperliquid_market_id(normalized_coin) if normalized_coin else ("", "")
+    coin_label = normalized_coin if normalized_coin else "ALL"
     attempt = 0
     while True:
         attempt += 1
         try:
             cache = get_ws_cache(info)
-            if cache is not None and not force_http:
+            if cache is not None and not force_http and not dex:
                 cached_state = await cache.get_user_state(force_refresh=False)
-                user_state = cached_state if cached_state is not None else await info.user_state(account_address)
+                user_state = (
+                    cached_state
+                    if cached_state is not None
+                    else await _info_method_with_optional_dex(info, "user_state", account_address, dex=dex)
+                )
             else:
-                user_state = await info.user_state(account_address)
+                user_state = await _info_method_with_optional_dex(info, "user_state", account_address, dex=dex)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -914,17 +990,18 @@ async def get_position_size_for_coin(
         force_http: bool = False,
 ) -> float:
     """Return signed position size for a coin, or 0.0 if flat/not found."""
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     user_state = await get_user_state_with_retry(
         info,
         account_address,
         context_label="get_position_size_for_coin",
-        coin=coin,
+        coin=normalized_coin,
         force_http=force_http,
     )
     asset_positions = user_state.get("assetPositions", [])
     for asset_pos in asset_positions:
         position = asset_pos.get("position", {})
-        if str(position.get("coin", "")).lower() == coin.lower():
+        if hyperliquid_market_ids_match(str(position.get("coin", "")), normalized_coin):
             try:
                 return float(position.get("szi", "0"))
             except (TypeError, ValueError):
@@ -940,16 +1017,17 @@ async def get_position_for_coin(
         force_http: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Return full position dict for a coin if the account has a non-zero position."""
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     user_state = await get_user_state_with_retry(
         info,
         account_address,
         context_label="get_position_for_coin",
-        coin=coin,
+        coin=normalized_coin,
         force_http=force_http,
     )
     for asset_pos in user_state.get("assetPositions", []):
         pos = asset_pos.get("position", {})
-        if str(pos.get("coin", "")).lower() != coin.lower():
+        if not hyperliquid_market_ids_match(str(pos.get("coin", "")), normalized_coin):
             continue
         try:
             if float(pos.get("szi", "0")) != 0.0:
@@ -974,7 +1052,7 @@ async def get_all_mids(info: Info) -> Dict[str, float]:
             value = float(px)
         except (TypeError, ValueError):
             continue
-        coin_str = str(coin)
+        coin_str = normalize_hyperliquid_market_id(str(coin))
         mids[coin_str] = value
         mids[coin_str.upper()] = value
     return mids
@@ -997,10 +1075,11 @@ async def fetch_recent_candles(
     if periods <= 0:
         raise RuntimeError("periods must be > 0")
 
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     if use_websocket_candles:
         cache = get_ws_cache(info)
         if cache is not None and cache.enabled:
-            cached_candles = await cache.get_recent_candles(coin, interval, periods)
+            cached_candles = await cache.get_recent_candles(normalized_coin, interval, periods)
             if cached_candles is not None:
                 return cached_candles
 
@@ -1010,9 +1089,9 @@ async def fetch_recent_candles(
     start_time = now_ms - window_ms
     end_time = now_ms
 
-    data = await info.candles_snapshot(coin, interval, start_time, end_time)
+    data = await info.candles_snapshot(normalized_coin, interval, start_time, end_time)
     if not isinstance(data, list) or not data:
-        raise RuntimeError(f"No candle data returned for {coin} {interval}.")
+        raise RuntimeError(f"No candle data returned for {normalized_coin} {interval}.")
 
     return data[-periods:]
 
@@ -1023,7 +1102,7 @@ async def fetch_recent_candles(
 def parse_position_snapshot(position: Dict[str, Any]) -> Tuple[str, float, float, str, float]:
     """Parse live position fields needed for management loops."""
     try:
-        coin = str(position["coin"]).upper().strip()
+        coin = normalize_hyperliquid_market_id(str(position["coin"]))
         signed_size = float(position["szi"])
         entry_px = float(position["entryPx"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -1115,7 +1194,7 @@ async def get_realized_pnl_since(
     for fill in fills:
         if not isinstance(fill, dict):
             continue
-        if coin_upper is not None and str(fill.get("coin", "")).upper() != coin_upper:
+        if coin_upper is not None and not hyperliquid_market_ids_match(str(fill.get("coin", "")), coin_upper):
             continue
         pnl = extract_closed_pnl_from_fill(fill)
         total += pnl

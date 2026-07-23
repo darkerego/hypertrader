@@ -48,6 +48,12 @@ class StrategyExecutionPlan:
 class AutoStrategy(ABC):
     name: str
 
+    async def start(self, **_: Any) -> None:
+        """Optional async lifecycle hook for strategies that own live state."""
+
+    async def shutdown(self) -> None:
+        """Optional async lifecycle hook for strategies that own live state."""
+
     @abstractmethod
     async def evaluate(self, context: StrategyContext) -> StrategySignal | None:
         """Evaluate the latest closed-candle market data and return one signal at most."""

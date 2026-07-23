@@ -147,3 +147,10 @@
 - Added `async_hyperliquid.py` with a standalone `AsyncHyperliquid` client that extracts reusable Hyperliquid exchange, account-state, websocket cache, market-data, candles, order placement, position sizing, fill waiting, position closing, account monitoring, and take-profit ladder logic out of the bot into a strategy-independent async library.
 - Added `tests/test_async_hyperliquid.py` with fake async SDK coverage for initialization, websocket callback bridging, cache/REST fallback behavior, rounding, order normalization, chase-entry behavior, market-close guards, candle streaming, fill waiters, TP reconciliation, retries, read-only safety, and shutdown behavior.
 - Validation in this environment: `python3 -m py_compile hypertrader.py` passed, `python3 -m compileall async_hyperliquid.py tests/test_async_hyperliquid.py` passed, `.venv/bin/python hypertrader.py --help` passed, `.venv/bin/python hypertrader.py enter --help` passed, and a manual fake-SDK smoke run of `AsyncHyperliquid.initialize()`, `get_account_balance()`, `get_mid()`, and `place_limit_order()` passed. `pytest`, `pytest-asyncio`, `ruff`, and `mypy` are not installed here, so those requested validation commands could not be executed.
+
+# 2026-07-23 13:54:45 EDT
+
+- Fixed trailing stop calculation
+- enhanced default auto strategy
+- various bugfixes and optimizations
+- Note: `reversal` strategy may need more debugging

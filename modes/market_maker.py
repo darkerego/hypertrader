@@ -12,7 +12,7 @@ from utils.helpers import init_clients, close_clients, extract_order_error
 from utils.constants import INTERVAL_TO_MS, PRICE_EPS
 from utils.helpers import get_all_mids, get_open_orders_for_coin, get_position_size_for_coin, \
     fetch_recent_candles, get_best_bid_ask, round_price_for_hyperliquid, \
-    round_size_for_hyperliquid
+    round_size_for_hyperliquid, hyperliquid_market_ids_match, normalize_hyperliquid_market_id
 
 def extract_order_px(order: Dict[str, Any]) -> float:
     """Extract order price across API variants."""
@@ -67,7 +67,10 @@ async def cancel_open_orders_for_coin(
     if existing_orders is None:
         coin_orders = await get_open_orders_for_coin(info, account_address, coin)
     else:
-        coin_orders = [order for order in existing_orders if str(order.get("coin", "")).lower() == coin.lower()]
+        coin_orders = [
+            order for order in existing_orders
+            if hyperliquid_market_ids_match(str(order.get("coin", "")), coin)
+        ]
 
     protected: List[Dict[str, Any]] = []
     cancel_requests: List[Dict[str, Any]] = []
@@ -205,7 +208,7 @@ async def run_market_maker(
     try:
         if owns_clients:
             account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
-        coin = coin.upper()
+        coin = normalize_hyperliquid_market_id(coin)
 
         print("============================================================")
         print(" Hyperliquid Async Market Maker")

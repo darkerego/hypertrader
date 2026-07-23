@@ -12,7 +12,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from enum import Enum
-from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Iterable, Literal, Sequence, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Iterable, Literal, Sequence, TypeVar, Tuple
 
 import dotenv
 import eth_account
@@ -1803,7 +1803,7 @@ class AsyncHyperliquid:
                     self.logger.warning("Websocket queue full for %s; retaining last reliable message only.", key)
                     raise HyperliquidConnectionError(f"Websocket queue overflow for {key}")
 
-            loop.call_soon_threadsafe(_put)
+            loop.call_soon_threadsafe(_put, )
 
         return callback
 
@@ -1969,9 +1969,10 @@ class AsyncHyperliquid:
     async def _fetch_mid_rest(self, coin: str) -> float:
         info = self.info
         assert info is not None
-        mids = await self._rest_call("all_mids", info.all_mids)
+        _mids, pending = await self._rest_call("all_mids", info.all_mids)
+
         value = None
-        for key, px in mids.items():
+        for key, px in _mids.items():
             if str(key).upper() == coin:
                 value = float(px)
                 break

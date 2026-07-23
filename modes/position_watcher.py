@@ -10,7 +10,7 @@ from modes.position_management import monitor_bracket_position, rebuild_bracket_
 from utils.constants import WATCH_RETRY_SLEEP_SECONDS
 from utils.helpers import init_clients, get_all_open_positions, get_all_mids, compute_position_unrealized_pnl, \
     get_account_runtime_metrics, format_account_metrics, is_rate_limit_error, close_clients, \
-    compute_default_stop_loss_pct
+    compute_default_stop_loss_pct, hyperliquid_market_ids_match, normalize_hyperliquid_market_id
 
 
 async def attach_bracket_to_existing_position(
@@ -35,7 +35,7 @@ async def attach_bracket_to_existing_position(
     metrics_start_time_ms: Optional[int] = None,
 ) -> None:
     """Attach TP/SL orders to an already-open position and monitor it."""
-    coin = str(position.get("coin", "")).upper().strip()
+    coin = normalize_hyperliquid_market_id(str(position.get("coin", "")))
     if not coin:
         raise RuntimeError(f"Cannot manage position without coin field: {position}")
 
@@ -252,7 +252,7 @@ async def run_position_watcher(
     if market_slippage < 0.0:
         raise RuntimeError("--market-slippage must be >= 0.")
 
-    normalized_only_coin = only_coin.upper() if only_coin else None
+    normalized_only_coin = normalize_hyperliquid_market_id(only_coin) if only_coin else None
     owns_clients = account_address is None and info is None and exchange is None
     if not owns_clients and (account_address is None or info is None or exchange is None):
         raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
@@ -267,10 +267,10 @@ async def run_position_watcher(
         if normalized_only_coin is not None:
             initial_positions = [
                 pos for pos in initial_positions
-                if str(pos.get("coin", "")).upper() == normalized_only_coin
+                if hyperliquid_market_ids_match(str(pos.get("coin", "")), normalized_only_coin)
             ]
         ignored_initial_coins = {
-            str(pos.get("coin", "")).upper()
+            normalize_hyperliquid_market_id(str(pos.get("coin", "")))
             for pos in initial_positions
             if str(pos.get("coin", "")).strip()
         }
@@ -325,10 +325,10 @@ async def run_position_watcher(
 
             current_open_coins: set[str] = set()
             for pos in positions:
-                coin = str(pos.get("coin", "")).upper().strip()
+                coin = normalize_hyperliquid_market_id(str(pos.get("coin", "")))
                 if not coin:
                     continue
-                if normalized_only_coin is not None and coin != normalized_only_coin:
+                if normalized_only_coin is not None and not hyperliquid_market_ids_match(coin, normalized_only_coin):
                     continue
                 current_open_coins.add(coin)
 

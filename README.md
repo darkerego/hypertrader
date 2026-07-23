@@ -250,6 +250,7 @@ Key options:
 `auto` now supports selectable strategies:
 
 - `default`: the existing MACD/SAR/ADX/Bollinger auto trader and the implicit default when `--strategy` is omitted
+- `orderflow_pullback`: order-flow-confirmed trend pullback scalp strategy, also available as `of_pullback` and `orderflow`
 - `reversal`: a closed-candle trend-exhaustion, structure-break, and retest strategy
 
 The strategy selection changes the signal engine only. Shared sizing, risk controls, modify-order entry, market-fallback cleanup, hidden-order behavior, and bracket management still run through the same common auto execution path.
@@ -270,6 +271,7 @@ python3 hypertrader.py auto [COIN] (--size SIZE | --size-pct SIZE_PCT) [options]
 Key options:
 
 - `--strategy {default,reversal}`
+- `--strategy {default,orderflow_pullback,reversal}` with aliases `of_pullback` and `orderflow`
 - `--size` or `--size-pct`
 - `--top-markets`
 - `--intervals`
@@ -366,6 +368,39 @@ python3 hypertrader.py auto --strategy reversal \
   --reversal-exhaustion-score 2 \
   --reversal-min-rr 1.8 \
   --reversal-exit-on-sar-flip
+```
+
+Order-flow pullback strategy notes:
+
+- Uses closed `1m`/`5m` candles for regime context and live `l2Book` plus `trades` websocket feeds for entry confirmation.
+- Indicators classify context only; executed trade flow, weighted book imbalance, and microprice authorize entries.
+- Entries still route through the shared modify-order post-only entry path.
+- Hidden-order mode still applies: `--hide-orders` keeps TP/SL targets local instead of placing exchange-visible brackets.
+
+Important order-flow options:
+
+- `--of-max-active-books`: maximum promoted markets with live book/trade monitoring
+- `--of-max-spread-bps` and `--of-max-spread-ratio`: live spread gates
+- `--of-min-depth-ratio`: executable depth gate versus intended order notional
+- `--of-warmup-seconds`: warm-up period after promotion before entries are allowed
+- `--of-min-edge-cost-multiple`: expected-move versus estimated round-trip-cost gate
+- `--of-pullback-min` and `--of-pullback-max`: retracement zone bounds
+- `--of-book-imbalance-min`, `--of-micro-bias-min`, `--of-trade-imbalance-2s-min`, and `--of-trade-imbalance-10s-min`: mandatory confirmation thresholds
+- `--of-entry-timeout-seconds` and `--of-max-chase-ticks`: entry aggressiveness controls layered onto the shared entry helper
+
+Example order-flow scan:
+
+```bash
+python3 hypertrader.py auto \
+  --strategy orderflow_pullback \
+  --top-markets 30 \
+  --size-pct 5 \
+  --scan-interval 1 \
+  --of-max-active-books 8 \
+  --of-max-spread-bps 3 \
+  --of-min-depth-ratio 10 \
+  --of-entry-timeout-seconds 2 \
+  --of-max-chase-ticks 2
 ```
 
 Example top-market reversal scan:

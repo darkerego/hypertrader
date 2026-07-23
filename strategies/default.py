@@ -234,20 +234,20 @@ def compute_bollinger_state(
 
 def _scalp_quality_label(side: str, percent_b: float) -> str:
     if side == "long":
-        if percent_b <= 0.25:
+        if percent_b >= 0.75:
             return "ideal"
-        if percent_b <= 0.35:
+        if percent_b >= 0.65:
             return "good"
-        if percent_b <= 0.50:
+        if percent_b >= 0.50:
             return "valid"
-        return "extended"
-    if percent_b >= 0.75:
+        return "weak"
+    if percent_b <= 0.25:
         return "ideal"
-    if percent_b >= 0.65:
+    if percent_b <= 0.35:
         return "good"
-    if percent_b >= 0.50:
+    if percent_b <= 0.50:
         return "valid"
-    return "extended"
+    return "weak"
 
 
 def confirm_signal_with_bollinger(
@@ -283,18 +283,18 @@ def confirm_signal_with_bollinger(
         entry_state = states["entry"]
         quality = _scalp_quality_label(normalized_side, entry_state.percent_b)
         if normalized_side == "long":
-            allowed = entry_state.percent_b <= 0.50
-            if not allowed:
-                return False, (
-                    f"mode=scalp side=long entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
-                    f"result=REJECT reason=\"long rejected: entry interval above middle band\" quality={quality}"
-                ), states
-        else:
             allowed = entry_state.percent_b >= 0.50
             if not allowed:
                 return False, (
+                    f"mode=scalp side=long entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
+                    f"result=REJECT reason=\"long rejected: entry interval below middle band\" quality={quality}"
+                ), states
+        else:
+            allowed = entry_state.percent_b <= 0.50
+            if not allowed:
+                return False, (
                     f"mode=scalp side=short entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
-                    f"result=REJECT reason=\"short rejected: entry interval below middle band\" quality={quality}"
+                    f"result=REJECT reason=\"short rejected: entry interval above middle band\" quality={quality}"
                 ), states
 
         return True, (
@@ -327,11 +327,11 @@ def confirm_signal_with_bollinger(
                 f"setup_tf={setup_state.interval} entry_tf={entry_state.interval} "
                 f"result=REJECT reason=\"long rejected: setup interval is already overextended high\""
             ), states
-        if entry_state.percent_b > 0.50:
+        if entry_state.percent_b < 0.50:
             return False, (
                 f"mode=non_scalp side=long regime_tf={regime_state.interval if regime_state is not None else 'N/A'} "
                 f"setup_tf={setup_state.interval if setup_state is not None else 'N/A'} entry_tf={entry_state.interval} "
-                f"result=REJECT reason=\"long rejected: entry interval above middle band\""
+                f"result=REJECT reason=\"long rejected: entry interval below middle band\""
             ), states
     else:
         if regime_state is not None:
@@ -353,11 +353,11 @@ def confirm_signal_with_bollinger(
                 f"setup_tf={setup_state.interval} entry_tf={entry_state.interval} "
                 f"result=REJECT reason=\"short rejected: setup interval is already overextended low\""
             ), states
-        if entry_state.percent_b < 0.50:
+        if entry_state.percent_b > 0.50:
             return False, (
                 f"mode=non_scalp side=short regime_tf={regime_state.interval if regime_state is not None else 'N/A'} "
                 f"setup_tf={setup_state.interval if setup_state is not None else 'N/A'} entry_tf={entry_state.interval} "
-                f"result=REJECT reason=\"short rejected: entry interval below middle band\""
+                f"result=REJECT reason=\"short rejected: entry interval above middle band\""
             ), states
 
     reason = (

@@ -5,7 +5,9 @@ from unittest import mock
 from strategies.reversal import (
     FractalPoint,
     FractalSeries,
+    ExhaustionResult,
     ReversalAutoStrategy,
+    RetestResult,
     StructureBreak,
     classify_prior_trend,
     detect_structure_break,
@@ -198,6 +200,129 @@ class ReversalStateIsolationTests(unittest.TestCase):
         self.assertIn("BTC", strategy._setups)
         self.assertIn("ETH", strategy._setups)
         self.assertNotEqual(strategy._setups["BTC"].coin, strategy._setups["ETH"].coin)
+
+    @mock.patch("strategies.reversal.evaluate_retest")
+    @mock.patch("strategies.reversal.detect_structure_break")
+    @mock.patch("strategies.reversal.calculate_exhaustion")
+    @mock.patch("strategies.reversal.classify_prior_trend")
+    @mock.patch("strategies.reversal.find_confirmed_fractals")
+    @mock.patch("strategies.reversal.require_talib_available")
+    def test_retest_confirmation_uses_persisted_structure_break(
+        self,
+        _mock_require_talib: mock.Mock,
+        mock_find_fractals: mock.Mock,
+        mock_classify_trend: mock.Mock,
+        mock_exhaustion: mock.Mock,
+        mock_detect_break: mock.Mock,
+        mock_evaluate_retest: mock.Mock,
+    ) -> None:
+        config = types.SimpleNamespace(
+            entry_interval="15m",
+            trend_interval="1h",
+            reversal_fractal_width=2,
+            reversal_retest_timeout=8,
+            reversal_retest_atr_tolerance=0.15,
+            reversal_retest_min_price_pct=0.001,
+            reversal_stop_atr_buffer=0.25,
+            reversal_max_stop_atr=2.5,
+            reversal_min_rr=1.8,
+            reversal_tp1_r=1.0,
+            reversal_tp2_r=2.0,
+            reversal_tp3_r=3.0,
+            reversal_tp1_pct=35.0,
+            reversal_tp2_pct=35.0,
+            reversal_runner_pct=30.0,
+            reversal_exit_on_sar_flip=True,
+            reversal_ema_trend_fast=20,
+            reversal_ema_trend_slow=50,
+            reversal_adx_period=14,
+            reversal_min_adx=18.0,
+            reversal_min_ema50_slope=0.0005,
+            reversal_atr_period=14,
+            reversal_rsi_period=14,
+            reversal_volume_climax_multiple=1.8,
+            reversal_extension_atr_multiple=1.8,
+            reversal_divergence_lookback=60,
+            reversal_min_swing_separation=5,
+            reversal_max_swing_separation=50,
+            reversal_min_rsi_divergence=2.0,
+            reversal_min_price_divergence_atr=0.05,
+            sar_acceleration=0.02,
+            sar_maximum=0.2,
+            reversal_exhaustion_score=2,
+            reversal_breakout_body_atr=0.30,
+            reversal_max_breakout_range_atr=2.50,
+            reversal_ema_fast=9,
+            reversal_ema_confirm=21,
+        )
+        strategy = ReversalAutoStrategy(config)
+        mock_find_fractals.return_value = FractalSeries(highs=(), lows=())
+        mock_classify_trend.return_value = "down"
+        mock_exhaustion.return_value = ExhaustionResult(
+            score=2,
+            reasons=("RSI divergence", "SAR flip"),
+            reversal_extreme=11.5,
+        )
+        mock_detect_break.return_value = StructureBreak("long", 12.0, 12.5, 1.0, 120_000, 0.5)
+        mock_evaluate_retest.side_effect = [
+            RetestResult(False, None, None, (), None, "awaiting retest", 120_000),
+            RetestResult(True, 12.4, 11.25, (13.55, 14.70, 16.30), 3.12, "retest confirmed", 180_000),
+        ]
+
+        context_breakout = types.SimpleNamespace(
+            coin="BTC",
+            now_ms=120_000,
+            config=config,
+            market_metadata={},
+            trend_candles=[_make_candle(0, 10, 11, 9, 10), _make_candle(3_600_000, 10, 11, 9, 10)],
+            entry_candles=[
+                _make_candle(0, 10, 11, 9, 10),
+                _make_candle(60_000, 10, 12, 9, 11),
+                _make_candle(120_000, 11, 13, 10, 12.5),
+                _make_candle(180_000, 12, 12.4, 11.8, 12.0),
+            ],
+            current_position=None,
+        )
+        first_signal = self._run_async(strategy.evaluate(context_breakout))
+        self.assertIsNone(first_signal)
+
+        mock_detect_break.reset_mock()
+        mock_classify_trend.reset_mock()
+        mock_exhaustion.reset_mock()
+
+        context_retest = types.SimpleNamespace(
+            coin="BTC",
+            now_ms=180_000,
+            config=config,
+            market_metadata={},
+            trend_candles=[
+                _make_candle(0, 10, 11, 9, 10),
+                _make_candle(3_600_000, 10, 11, 9, 10),
+                _make_candle(7_200_000, 10, 11, 9, 10),
+            ],
+            entry_candles=[
+                _make_candle(0, 10, 11, 9, 10),
+                _make_candle(60_000, 10, 12, 9, 11),
+                _make_candle(120_000, 11, 13, 10, 12.5),
+                _make_candle(180_000, 12.0, 12.8, 11.95, 12.4),
+                _make_candle(240_000, 12.2, 12.5, 12.1, 12.3),
+            ],
+            current_position=None,
+        )
+        second_signal = self._run_async(strategy.evaluate(context_retest))
+        self.assertIsNotNone(second_signal)
+        assert second_signal is not None
+        self.assertEqual(second_signal.direction, "long")
+        self.assertAlmostEqual(second_signal.entry_price, 12.4)
+        self.assertEqual(second_signal.signal_candle_ms, 180_000)
+        mock_detect_break.assert_not_called()
+        mock_classify_trend.assert_not_called()
+        mock_exhaustion.assert_not_called()
+
+    def _run_async(self, awaitable):
+        import asyncio
+
+        return asyncio.run(awaitable)
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-from strategies.registry import available_strategies
+from strategies.registry import available_strategy_names, available_strategies, normalize_strategy_name
 
 from hyperliquid.info import Info
 
@@ -32,7 +32,7 @@ from modes.position_management import run_bracket_entry
 from modes.position_watcher import run_position_watcher
 from modes.trailing_stop import trailing_stop_for_all_positions
 from utils.constants import DEFAULT_LOG_FILE, INTERVAL_TO_MS
-from utils.helpers import parse_fractional_pct
+from utils.helpers import parse_fractional_pct, normalize_hyperliquid_market_id, split_hyperliquid_market_id
 from utils.style import install_pretty_stdout
 
 try:
@@ -107,9 +107,15 @@ async def _compat_name_to_asset(self: Info, name: str) -> int:
 
     name_to_coin = getattr(self, "name_to_coin", {})
     coin_to_asset = getattr(self, "coin_to_asset", {})
-    coin = name_to_coin.get(name, name)
+    normalized_name = normalize_hyperliquid_market_id(name)
+    _, base_symbol = split_hyperliquid_market_id(normalized_name)
+    coin = name_to_coin.get(normalized_name, normalized_name)
     if coin not in coin_to_asset:
-        raise KeyError(f"No Hyperliquid asset id found for {name!r}; known names include {list(name_to_coin)[:20]}")
+        coin = name_to_coin.get(base_symbol, base_symbol)
+    if coin not in coin_to_asset:
+        raise KeyError(
+            f"No Hyperliquid asset id found for {name!r}; known names include {list(name_to_coin)[:20]}"
+        )
     return int(coin_to_asset[coin])
 
 
@@ -150,7 +156,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     trailing_parser = subparsers.add_parser("trailing", help="Trailing stop manager for open perp positions.")
     trailing_parser.add_argument("coin", type=str, nargs="?", default=None, help="Optional coin symbol, e.g. BTC, ETH.")
     trailing_parser.add_argument("--trail-pct", type=float, default=0.01,
-                                 help="Trailing distance fraction, e.g. 0.01 = 1pct.")
+                                 help="Fraction of favorable unrealized profit to give back before exit, e.g. 0.33 keeps 67pct.")
     trailing_parser.add_argument("--poll-interval", type=float, default=2.0,
                                  help="Polling interval in seconds. Default: 2.0.")
     trailing_parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid testnet instead of mainnet.")
@@ -258,7 +264,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                  help="Percent of available collateral to use for sizing. Accepts 10, 10%%, or 0.10.")
     auto_parser.add_argument("--top-markets", type=int, default=10,
                              help="When auto coin is omitted, scan the top N perp markets by day notional volume. Default: 10.")
-    auto_parser.add_argument("--strategy", type=str, default="default", choices=available_strategies(),
+    auto_parser.add_argument("--strategy", type=str, default="default", choices=available_strategy_names(),
                              help="Auto strategy selection. Default: default.")
     auto_parser.add_argument("--intervals", type=str, default="1h,15m,5m,1m",
                              help="Comma/space separated intervals. Default: 1h,15m,5m,1m.")
@@ -407,6 +413,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     reversal_exit_group.add_argument("--reversal-exit-on-sar-flip", dest="reversal_exit_on_sar_flip", action="store_true")
     reversal_exit_group.add_argument("--no-reversal-exit-on-sar-flip", dest="reversal_exit_on_sar_flip", action="store_false")
     auto_parser.set_defaults(reversal_exit_on_sar_flip=True)
+    orderflow_group = auto_parser.add_argument_group("Order-flow pullback strategy")
+    orderflow_group.add_argument("--of-max-active-books", type=int, default=8)
+    orderflow_group.add_argument("--of-max-spread-bps", type=float, default=3.0)
+    orderflow_group.add_argument("--of-max-spread-ratio", type=float, default=1.5)
+    orderflow_group.add_argument("--of-depth-bps", type=float, default=5.0)
+    orderflow_group.add_argument("--of-min-depth-ratio", type=float, default=10.0)
+    orderflow_group.add_argument("--of-max-data-age-seconds", type=float, default=1.5)
+    orderflow_group.add_argument("--of-warmup-seconds", type=float, default=60.0)
+    orderflow_group.add_argument("--of-min-edge-cost-multiple", type=float, default=2.5)
+    orderflow_group.add_argument("--of-trend-efficiency-min", type=float, default=0.30)
+    orderflow_group.add_argument("--of-adx-min", type=float, default=18.0)
+    orderflow_group.add_argument("--of-impulse-atr-multiple", type=float, default=0.35)
+    orderflow_group.add_argument("--of-impulse-spread-multiple", type=float, default=4.0)
+    orderflow_group.add_argument("--of-impulse-flow-min", type=float, default=0.20)
+    orderflow_group.add_argument("--of-impulse-volume-ratio-min", type=float, default=1.40)
+    orderflow_group.add_argument("--of-impulse-expiry-seconds", type=float, default=120.0)
+    orderflow_group.add_argument("--of-pullback-min", type=float, default=0.20)
+    orderflow_group.add_argument("--of-pullback-max", type=float, default=0.60)
+    orderflow_group.add_argument("--of-pullback-min-seconds", type=float, default=5.0)
+    orderflow_group.add_argument("--of-pullback-timeout-seconds", type=float, default=90.0)
+    orderflow_group.add_argument("--of-book-imbalance-min", type=float, default=0.15)
+    orderflow_group.add_argument("--of-micro-bias-min", type=float, default=0.10)
+    orderflow_group.add_argument("--of-trade-imbalance-2s-min", type=float, default=0.20)
+    orderflow_group.add_argument("--of-trade-imbalance-10s-min", type=float, default=0.08)
+    orderflow_group.add_argument("--of-confirmations-required", type=int, default=2)
+    orderflow_group.add_argument("--of-confirmation-window", type=int, default=3)
+    orderflow_group.add_argument("--of-min-score", type=float, default=0.70)
+    orderflow_group.add_argument("--of-min-flow-score", type=float, default=0.60)
+    orderflow_group.add_argument("--of-min-book-score", type=float, default=0.55)
+    orderflow_group.add_argument("--of-entry-timeout-seconds", type=float, default=2.0)
+    orderflow_group.add_argument("--of-max-chase-ticks", type=int, default=2)
+    orderflow_group.add_argument("--of-allow-market-fallback", action="store_true")
+    orderflow_group.add_argument("--of-stop-atr-fraction", type=float, default=0.10)
+    orderflow_group.add_argument("--of-tp1-r", type=float, default=1.0)
+    orderflow_group.add_argument("--of-tp1-size-pct", type=float, default=50.0)
+    orderflow_group.add_argument("--of-tp2-r", type=float, default=1.6)
+    orderflow_group.add_argument("--of-continuation-timeout-seconds", type=float, default=45.0)
+    orderflow_group.add_argument("--of-continuation-min-progress-r", type=float, default=0.35)
+    orderflow_group.add_argument("--of-max-hold-seconds", type=float, default=180.0)
+    of_flow_scratch_group = orderflow_group.add_mutually_exclusive_group()
+    of_flow_scratch_group.add_argument("--of-flow-scratch", dest="of_flow_scratch", action="store_true")
+    of_flow_scratch_group.add_argument("--no-of-flow-scratch", dest="of_flow_scratch", action="store_false")
+    orderflow_group.add_argument("--of-flow-scratch-grace-seconds", type=float, default=1.0)
+    orderflow_group.add_argument("--of-log-evaluations", action="store_true")
+    auto_parser.set_defaults(of_flow_scratch=True)
 
     mm_parser = subparsers.add_parser(
         "market_maker",
@@ -448,7 +499,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             trail_pct=args.trail_pct,
             poll_interval=args.poll_interval,
             use_testnet=args.testnet,
-            only_coin=(args.coin.upper() if args.coin is not None else None),
+            only_coin=(normalize_hyperliquid_market_id(args.coin) if args.coin is not None else None),
             use_websocket=(not args.no_websocket),
             hide_orders=args.hide_orders,
         )
@@ -490,7 +541,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             sys.exit(1)
 
         await run_bracket_entry(
-            coin=args.coin.upper(),
+            coin=normalize_hyperliquid_market_id(args.coin),
             direction=args.direction,
             size=args.size,
             take_profit_pct=args.take_profit_pct,
@@ -544,7 +595,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             sys.exit(1)
 
         await run_position_watcher(
-            only_coin=(args.coin.upper() if args.coin is not None else None),
+            only_coin=(normalize_hyperliquid_market_id(args.coin) if args.coin is not None else None),
             take_profit_pct=args.take_profit_pct,
             stop_loss_pct=args.stop_loss_pct,
             take_profit_levels=args.take_profit_levels,
@@ -567,6 +618,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
 
     if args.command == "auto":
         from modes.auto_trader import run_auto_trader
+        args.strategy = normalize_strategy_name(args.strategy)
 
         if args.size is not None and args.size <= 0.0:
             print("[ERROR] --size must be > 0.")
@@ -714,9 +766,37 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             if abs((args.reversal_tp1_pct + args.reversal_tp2_pct + args.reversal_runner_pct) - 100.0) > 1e-9:
                 print("[ERROR] Reversal TP percentages must total 100.")
                 sys.exit(1)
+        if args.strategy == "orderflow_pullback":
+            if not (0.0 < args.of_pullback_min < args.of_pullback_max < 1.0):
+                print("[ERROR] Require 0 < --of-pullback-min < --of-pullback-max < 1.")
+                sys.exit(1)
+            if not (args.of_confirmation_window >= args.of_confirmations_required >= 1):
+                print("[ERROR] Require --of-confirmation-window >= --of-confirmations-required >= 1.")
+                sys.exit(1)
+            if args.of_max_active_books < 1:
+                print("[ERROR] --of-max-active-books must be >= 1.")
+                sys.exit(1)
+            if args.of_max_chase_ticks < 0:
+                print("[ERROR] --of-max-chase-ticks must be >= 0.")
+                sys.exit(1)
+            if args.of_max_data_age_seconds <= 0.0:
+                print("[ERROR] --of-max-data-age-seconds must be > 0.")
+                sys.exit(1)
+            if args.of_entry_timeout_seconds <= 0.0:
+                print("[ERROR] --of-entry-timeout-seconds must be > 0.")
+                sys.exit(1)
+            if args.of_min_edge_cost_multiple <= 1.0:
+                print("[ERROR] --of-min-edge-cost-multiple must be > 1.")
+                sys.exit(1)
+            if not (0.0 < args.of_tp1_size_pct <= 100.0):
+                print("[ERROR] --of-tp1-size-pct must be > 0 and <= 100.")
+                sys.exit(1)
+            if min(args.of_tp1_r, args.of_tp2_r) <= 0.0:
+                print("[ERROR] --of-tp1-r and --of-tp2-r must be > 0.")
+                sys.exit(1)
 
         await run_auto_trader(
-            coin=(args.coin.upper() if args.coin is not None else None),
+            coin=(normalize_hyperliquid_market_id(args.coin) if args.coin is not None else None),
             strategy_name=args.strategy,
             size=args.size,
             size_pct=args.size_pct,
@@ -811,6 +891,47 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             reversal_runner_pct=args.reversal_runner_pct,
             reversal_exit_on_sar_flip=args.reversal_exit_on_sar_flip,
             reversal_min_ema50_slope=args.reversal_min_ema50_slope,
+            of_max_active_books=args.of_max_active_books,
+            of_max_spread_bps=args.of_max_spread_bps,
+            of_max_spread_ratio=args.of_max_spread_ratio,
+            of_depth_bps=args.of_depth_bps,
+            of_min_depth_ratio=args.of_min_depth_ratio,
+            of_max_data_age_seconds=args.of_max_data_age_seconds,
+            of_warmup_seconds=args.of_warmup_seconds,
+            of_min_edge_cost_multiple=args.of_min_edge_cost_multiple,
+            of_trend_efficiency_min=args.of_trend_efficiency_min,
+            of_adx_min=args.of_adx_min,
+            of_impulse_atr_multiple=args.of_impulse_atr_multiple,
+            of_impulse_spread_multiple=args.of_impulse_spread_multiple,
+            of_impulse_flow_min=args.of_impulse_flow_min,
+            of_impulse_volume_ratio_min=args.of_impulse_volume_ratio_min,
+            of_impulse_expiry_seconds=args.of_impulse_expiry_seconds,
+            of_pullback_min=args.of_pullback_min,
+            of_pullback_max=args.of_pullback_max,
+            of_pullback_min_seconds=args.of_pullback_min_seconds,
+            of_pullback_timeout_seconds=args.of_pullback_timeout_seconds,
+            of_book_imbalance_min=args.of_book_imbalance_min,
+            of_micro_bias_min=args.of_micro_bias_min,
+            of_trade_imbalance_2s_min=args.of_trade_imbalance_2s_min,
+            of_trade_imbalance_10s_min=args.of_trade_imbalance_10s_min,
+            of_confirmations_required=args.of_confirmations_required,
+            of_confirmation_window=args.of_confirmation_window,
+            of_min_score=args.of_min_score,
+            of_min_flow_score=args.of_min_flow_score,
+            of_min_book_score=args.of_min_book_score,
+            of_entry_timeout_seconds=args.of_entry_timeout_seconds,
+            of_max_chase_ticks=args.of_max_chase_ticks,
+            of_allow_market_fallback=args.of_allow_market_fallback,
+            of_stop_atr_fraction=args.of_stop_atr_fraction,
+            of_tp1_r=args.of_tp1_r,
+            of_tp1_size_pct=args.of_tp1_size_pct,
+            of_tp2_r=args.of_tp2_r,
+            of_continuation_timeout_seconds=args.of_continuation_timeout_seconds,
+            of_continuation_min_progress_r=args.of_continuation_min_progress_r,
+            of_max_hold_seconds=args.of_max_hold_seconds,
+            of_flow_scratch=args.of_flow_scratch,
+            of_flow_scratch_grace_seconds=args.of_flow_scratch_grace_seconds,
+            of_log_evaluations=args.of_log_evaluations,
         )
         return
 
@@ -831,7 +952,7 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             print("[ERROR] --rebalance-threshold-pct must be > 0.")
             sys.exit(1)
         await run_market_maker(
-            coin=args.coin.upper(),
+            coin=normalize_hyperliquid_market_id(args.coin),
             interval=args.interval,
             periods=args.periods,
             levels=args.levels,

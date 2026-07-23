@@ -89,6 +89,7 @@ class ReversalSetup:
     structure_break_close: float = 0.0
     structure_break_atr: float = 0.0
     structure_break_candle_ms: int = 0
+    structure_break_body_atr: float = 0.0
     reversal_extreme: float = 0.0
     retest_deadline_candle_ms: Optional[int] = None
     retest_attempts: int = 0
@@ -653,6 +654,94 @@ class ReversalAutoStrategy(AutoStrategy):
             if setup is not None and setup.last_processed_candle_ms == latest_entry_ms:
                 return None
 
+            entry_fractals = find_confirmed_fractals(entry_candles, width=int(self.config.reversal_fractal_width))
+            if (
+                setup is not None
+                and setup.state == ReversalState.WAITING_FOR_RETEST
+                and setup.structure_break_candle_ms > 0
+                and setup.reversal_extreme > 0.0
+            ):
+                structure_break = StructureBreak(
+                    direction=setup.direction,
+                    level=setup.structure_level,
+                    close=setup.structure_break_close,
+                    atr=setup.structure_break_atr,
+                    candle_ms=setup.structure_break_candle_ms,
+                    body_atr=setup.structure_break_body_atr,
+                )
+                retest = evaluate_retest(
+                    candles=entry_candles,
+                    structure_break=structure_break,
+                    reversal_extreme=setup.reversal_extreme,
+                    timeout_candles=int(self.config.reversal_retest_timeout),
+                    retest_atr_tolerance=float(self.config.reversal_retest_atr_tolerance),
+                    retest_min_price_pct=float(self.config.reversal_retest_min_price_pct),
+                    stop_atr_buffer=float(self.config.reversal_stop_atr_buffer),
+                    max_stop_atr=float(self.config.reversal_max_stop_atr),
+                    min_rr=float(self.config.reversal_min_rr),
+                    tp1_r=float(self.config.reversal_tp1_r),
+                    tp2_r=float(self.config.reversal_tp2_r),
+                    tp3_r=float(self.config.reversal_tp3_r),
+                    sar_acceleration=float(self.config.sar_acceleration),
+                    sar_maximum=float(self.config.sar_maximum),
+                    fractals=entry_fractals,
+                    entry_interval_ms=int(INTERVAL_TO_MS[self.config.entry_interval]),
+                )
+                setup.last_processed_candle_ms = latest_entry_ms
+                if not retest.confirmed:
+                    if retest.reason == "awaiting retest":
+                        self._state_log(
+                            coin,
+                            f"Retest still pending: level={setup.structure_level:.8f}, "
+                            f"deadline={setup.retest_deadline_candle_ms}",
+                        )
+                        return None
+                    self._invalidate(setup, retest.reason)
+                    return None
+
+                setup.state = ReversalState.RETEST_CONFIRMED
+                setup.proposed_entry = retest.expected_entry
+                setup.proposed_stop = retest.stop_price
+                setup.proposed_tp1 = retest.take_profit_prices[0] if len(retest.take_profit_prices) > 0 else None
+                setup.proposed_tp2 = retest.take_profit_prices[1] if len(retest.take_profit_prices) > 1 else None
+                setup.proposed_tp3 = retest.take_profit_prices[2] if len(retest.take_profit_prices) > 2 else None
+                setup.expected_rr = retest.expected_rr
+                setup.invalidation_reason = None
+                self._state_log(coin, f"Retest confirmed: expected entry={retest.expected_entry:.8f}")
+                self._state_log(
+                    coin,
+                    f"Proposed stop={retest.stop_price:.8f}, TP1={retest.take_profit_prices[0]:.8f}, "
+                    f"TP2={retest.take_profit_prices[1]:.8f}, R:R={retest.expected_rr:.2f}",
+                )
+                return StrategySignal(
+                    strategy=self.name,
+                    coin=coin,
+                    direction=setup.direction,
+                    signal_candle_ms=retest.candle_ms,
+                    entry_price=float(retest.expected_entry),
+                    stop_price=float(retest.stop_price),
+                    take_profit_prices=tuple(float(value) for value in retest.take_profit_prices),
+                    score=float(setup.exhaustion_score + setup.structure_break_body_atr + (retest.expected_rr or 0.0)),
+                    reasons=tuple(setup.exhaustion_reasons) + ("structure break", "retest confirmed"),
+                    metadata={
+                        "prior_trend": setup.prior_trend,
+                        "trend_interval": self.config.trend_interval,
+                        "entry_interval": self.config.entry_interval,
+                        "exhaustion_score": setup.exhaustion_score,
+                        "exhaustion_reasons": tuple(setup.exhaustion_reasons),
+                        "structure_level": setup.structure_level,
+                        "structure_break_timestamp": setup.structure_break_candle_ms,
+                        "reversal_extreme": setup.reversal_extreme,
+                        "expected_rr": retest.expected_rr,
+                        "runner_exit_on_sar_flip": bool(self.config.reversal_exit_on_sar_flip),
+                        "tp_allocations": (
+                            float(self.config.reversal_tp1_pct),
+                            float(self.config.reversal_tp2_pct),
+                            float(self.config.reversal_runner_pct),
+                        ),
+                    },
+                )
+
             trend_fractals = find_confirmed_fractals(trend_candles, width=int(self.config.reversal_fractal_width))
             prior_trend = classify_prior_trend(
                 trend_candles,
@@ -677,7 +766,6 @@ class ReversalAutoStrategy(AutoStrategy):
                 return None
 
             direction: Literal["long", "short"] = "long" if prior_trend == "down" else "short"
-            entry_fractals = find_confirmed_fractals(entry_candles, width=int(self.config.reversal_fractal_width))
             exhaustion = calculate_exhaustion(
                 candles=entry_candles,
                 fractals=entry_fractals,
@@ -776,6 +864,7 @@ class ReversalAutoStrategy(AutoStrategy):
                 structure_break_close=structure_break.close,
                 structure_break_atr=structure_break.atr,
                 structure_break_candle_ms=structure_break.candle_ms,
+                structure_break_body_atr=structure_break.body_atr,
                 reversal_extreme=float(exhaustion.reversal_extreme),
                 retest_deadline_candle_ms=structure_break.candle_ms + (int(self.config.reversal_retest_timeout) * int(INTERVAL_TO_MS[self.config.entry_interval])),
                 proposed_entry=retest.expected_entry,

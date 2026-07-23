@@ -20,10 +20,12 @@ from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, PRICE_EPS, cp
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
-    extract_closed_pnl_from_fill, is_rate_limit_error, get_user_fills_since
+    extract_closed_pnl_from_fill, is_rate_limit_error, get_user_fills_since, normalize_hyperliquid_market_id, \
+    split_hyperliquid_market_id, post_active_asset_data, _info_meta_with_optional_dex
 
 logger = logging.getLogger(__name__)
 _AUTO_TRADES_LOGGER: Optional[logging.Logger] = None
+AUTO_RATE_LIMIT_BACKOFF_SECONDS = 5.0
 
 try:
     import numpy as np
@@ -59,6 +61,21 @@ def get_auto_trades_logger() -> logging.Logger:
     _AUTO_TRADES_LOGGER = auto_logger
     return auto_logger
 
+
+def log_auto_trade_event(
+    auto_logger: logging.Logger,
+    event: str,
+    *,
+    coin: Optional[str] = None,
+    **payload: Any,
+) -> None:
+    """Write a structured auto-mode event to the dedicated auto-trade log."""
+    record: Dict[str, Any] = {"event": event}
+    if coin:
+        record["coin"] = normalize_hyperliquid_market_id(str(coin))
+    record.update(payload)
+    auto_logger.info(json.dumps(_normalize_auto_log_value(record), sort_keys=True))
+
 def require_talib_available() -> None:
     """Fail early with an actionable message when auto-mode dependencies are missing."""
     if np is None or talib is None:
@@ -68,6 +85,15 @@ def require_talib_available() -> None:
             "On Debian/Ubuntu, if the wheel is unavailable, install the TA-Lib C library first, for example:\n"
             "  sudo apt-get update && sudo apt-get install -y build-essential ta-lib\n"
         )
+
+
+async def _sleep_after_rate_limit(context: str, exc: BaseException, *, sleep_seconds: float) -> None:
+    """Back off the scan loop after an exchange 429 instead of crashing the process."""
+    print(
+        f"[RATE-LIMIT] {context} hit Hyperliquid rate limit ({exc}). "
+        f"Sleeping {sleep_seconds:.1f}s before retry."
+    )
+    await asyncio.sleep(sleep_seconds)
 
 async def get_top_perp_markets_by_volume(info: Info, limit: int) -> List[Tuple[str, float]]:
     """Return the top perp markets ranked by reported day notional volume."""
@@ -88,7 +114,7 @@ async def get_top_perp_markets_by_volume(info: Info, limit: int) -> List[Tuple[s
     for asset_info, ctx in zip(universe, asset_ctxs):
         if not isinstance(asset_info, dict) or not isinstance(ctx, dict):
             continue
-        coin = str(asset_info.get("name") or ctx.get("coin") or "").upper()
+        coin = normalize_hyperliquid_market_id(str(asset_info.get("name") or ctx.get("coin") or ""))
         if not coin:
             continue
         volume = _try_float(ctx.get("dayNtlVlm"))
@@ -1139,20 +1165,20 @@ def compute_bollinger_state(
 def _scalp_quality_label(side: str, percent_b: float) -> str:
     """Return scalp-mode quality label for logs."""
     if side == "long":
-        if percent_b <= 0.25:
+        if percent_b >= 0.75:
             return "ideal"
-        if percent_b <= 0.35:
+        if percent_b >= 0.65:
             return "good"
-        if percent_b <= 0.50:
+        if percent_b >= 0.50:
             return "valid"
-        return "extended"
-    if percent_b >= 0.75:
+        return "weak"
+    if percent_b <= 0.25:
         return "ideal"
-    if percent_b >= 0.65:
+    if percent_b <= 0.35:
         return "good"
-    if percent_b >= 0.50:
+    if percent_b <= 0.50:
         return "valid"
-    return "extended"
+    return "weak"
 
 
 def confirm_signal_with_bollinger(
@@ -1189,18 +1215,18 @@ def confirm_signal_with_bollinger(
         entry_state = states["entry"]
         quality = _scalp_quality_label(normalized_side, entry_state.percent_b)
         if normalized_side == "long":
-            allowed = entry_state.percent_b <= 0.50
-            if not allowed:
-                return False, (
-                    f"mode=scalp side=long entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
-                    f"result=REJECT reason=\"long rejected: entry interval above middle band\" quality={quality}"
-                ), states
-        else:
             allowed = entry_state.percent_b >= 0.50
             if not allowed:
                 return False, (
+                    f"mode=scalp side=long entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
+                    f"result=REJECT reason=\"long rejected: entry interval below middle band\" quality={quality}"
+                ), states
+        else:
+            allowed = entry_state.percent_b <= 0.50
+            if not allowed:
+                return False, (
                     f"mode=scalp side=short entry_tf={entry_state.interval} %B={entry_state.percent_b:.3f} "
-                    f"result=REJECT reason=\"short rejected: entry interval below middle band\" quality={quality}"
+                    f"result=REJECT reason=\"short rejected: entry interval above middle band\" quality={quality}"
                 ), states
 
         return True, (
@@ -1233,11 +1259,11 @@ def confirm_signal_with_bollinger(
                 f"setup_tf={setup_state.interval} entry_tf={entry_state.interval} "
                 f"result=REJECT reason=\"long rejected: setup interval is already overextended high\""
             ), states
-        if entry_state.percent_b > 0.50:
+        if entry_state.percent_b < 0.50:
             return False, (
                 f"mode=non_scalp side=long regime_tf={regime_state.interval if regime_state is not None else 'N/A'} "
                 f"setup_tf={setup_state.interval if setup_state is not None else 'N/A'} entry_tf={entry_state.interval} "
-                f"result=REJECT reason=\"long rejected: entry interval above middle band\""
+                f"result=REJECT reason=\"long rejected: entry interval below middle band\""
             ), states
     else:
         if regime_state is not None:
@@ -1259,11 +1285,11 @@ def confirm_signal_with_bollinger(
                 f"setup_tf={setup_state.interval} entry_tf={entry_state.interval} "
                 f"result=REJECT reason=\"short rejected: setup interval is already overextended low\""
             ), states
-        if entry_state.percent_b < 0.50:
+        if entry_state.percent_b > 0.50:
             return False, (
                 f"mode=non_scalp side=short regime_tf={regime_state.interval if regime_state is not None else 'N/A'} "
                 f"setup_tf={setup_state.interval if setup_state is not None else 'N/A'} entry_tf={entry_state.interval} "
-                f"result=REJECT reason=\"short rejected: entry interval below middle band\""
+                f"result=REJECT reason=\"short rejected: entry interval above middle band\""
             ), states
 
     reason = (
@@ -1295,7 +1321,7 @@ async def resolve_size_pct_from_active_asset_data(
     turns `--size-pct` into a percent of the unlevered side capacity.
     """
     try:
-        active_asset_data = await info.post("/info", {"type": "activeAssetData", "user": account_address, "coin": coin})
+        active_asset_data = await post_active_asset_data(info, account_address, coin)
     except Exception as exc:
         return None, f"activeAssetData request failed: {exc}"
 
@@ -1373,7 +1399,7 @@ async def get_instrument_leverage_for_size_pct(
 ) -> Tuple[Optional[decimal.Decimal], str]:
     """Return leverage for manual --size-pct fallback sizing."""
     try:
-        active_asset_data = await info.post("/info", {"type": "activeAssetData", "user": account_address, "coin": coin})
+        active_asset_data = await post_active_asset_data(info, account_address, coin)
     except Exception as exc:
         active_asset_data = None
         active_asset_reason = f"activeAssetData request failed: {exc}"
@@ -1387,7 +1413,8 @@ async def get_instrument_leverage_for_size_pct(
             active_asset_reason = f"activeAssetData returned {type(active_asset_data).__name__}, expected dict"
 
     try:
-        meta = await info.meta()
+        dex, _ = split_hyperliquid_market_id(coin)
+        meta = await _info_meta_with_optional_dex(info, dex=dex)
     except Exception as exc:
         return None, f"{active_asset_reason}; meta request failed: {exc}"
 
@@ -1395,11 +1422,11 @@ async def get_instrument_leverage_for_size_pct(
     if not isinstance(universe, list):
         return None, f"{active_asset_reason}; meta.universe missing"
 
-    normalized_coin = str(coin).upper()
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     for asset_info in universe:
         if not isinstance(asset_info, dict):
             continue
-        asset_name = str(asset_info.get("name") or "").upper()
+        asset_name = normalize_hyperliquid_market_id(str(asset_info.get("name") or ""))
         if asset_name != normalized_coin:
             continue
         for key in ("maxLeverage", "maxLev", "max_leverage", "leverage"):
@@ -1517,7 +1544,7 @@ def last_finite_index(*arrays: Any) -> int:
 
 def is_unknown_market_error(exc: BaseException, coin: str) -> bool:
     """Return True when the candle fetch failed because the market key does not exist."""
-    normalized_coin = str(coin).upper()
+    normalized_coin = normalize_hyperliquid_market_id(coin)
     if isinstance(exc, KeyError):
         return str(exc).strip("'").upper() == normalized_coin
     for arg in getattr(exc, "args", ()):
@@ -1901,6 +1928,8 @@ async def scan_auto_trade_candidate(
     required_intervals: List[str]
     if strategy.name == "reversal":
         required_intervals = [str(strategy_config.trend_interval), str(strategy_config.entry_interval)]
+    elif strategy.name == "orderflow_pullback":
+        required_intervals = ["5m", "1m"]
     else:
         required_intervals = list(strategy_config.intervals)
 
@@ -2059,6 +2088,47 @@ async def run_auto_trader(
     reversal_runner_pct: float = 30.0,
     reversal_exit_on_sar_flip: bool = True,
     reversal_min_ema50_slope: float = 0.0005,
+    of_max_active_books: int = 8,
+    of_max_spread_bps: float = 3.0,
+    of_max_spread_ratio: float = 1.5,
+    of_depth_bps: float = 5.0,
+    of_min_depth_ratio: float = 10.0,
+    of_max_data_age_seconds: float = 1.5,
+    of_warmup_seconds: float = 60.0,
+    of_min_edge_cost_multiple: float = 2.5,
+    of_trend_efficiency_min: float = 0.30,
+    of_adx_min: float = 18.0,
+    of_impulse_atr_multiple: float = 0.35,
+    of_impulse_spread_multiple: float = 4.0,
+    of_impulse_flow_min: float = 0.20,
+    of_impulse_volume_ratio_min: float = 1.40,
+    of_impulse_expiry_seconds: float = 120.0,
+    of_pullback_min: float = 0.20,
+    of_pullback_max: float = 0.60,
+    of_pullback_min_seconds: float = 5.0,
+    of_pullback_timeout_seconds: float = 90.0,
+    of_book_imbalance_min: float = 0.15,
+    of_micro_bias_min: float = 0.10,
+    of_trade_imbalance_2s_min: float = 0.20,
+    of_trade_imbalance_10s_min: float = 0.08,
+    of_confirmations_required: int = 2,
+    of_confirmation_window: int = 3,
+    of_min_score: float = 0.70,
+    of_min_flow_score: float = 0.60,
+    of_min_book_score: float = 0.55,
+    of_entry_timeout_seconds: float = 2.0,
+    of_max_chase_ticks: int = 2,
+    of_allow_market_fallback: bool = False,
+    of_stop_atr_fraction: float = 0.10,
+    of_tp1_r: float = 1.0,
+    of_tp1_size_pct: float = 50.0,
+    of_tp2_r: float = 1.6,
+    of_continuation_timeout_seconds: float = 45.0,
+    of_continuation_min_progress_r: float = 0.35,
+    of_max_hold_seconds: float = 180.0,
+    of_flow_scratch: bool = True,
+    of_flow_scratch_grace_seconds: float = 1.0,
+    of_log_evaluations: bool = False,
     account_address: Optional[str] = None,
     info: Optional[Info] = None,
     exchange: Optional[Exchange] = None,
@@ -2066,7 +2136,7 @@ async def run_auto_trader(
     """Automatically scan TA-Lib signals, enter positions, and hand off to bracket management."""
 
     require_talib_available()
-    coin = coin.upper() if coin is not None else None
+    coin = normalize_hyperliquid_market_id(coin) if coin is not None else None
     intervals = parse_interval_list(intervals_value)
     if (size is None) == (size_pct is None):
         raise RuntimeError("Specify exactly one of --size or --size-pct.")
@@ -2202,12 +2272,57 @@ async def run_auto_trader(
         reversal_exit_on_sar_flip=reversal_exit_on_sar_flip,
         reversal_min_ema50_slope=reversal_min_ema50_slope,
         reversal_history_periods=max(300, periods),
+        of_max_active_books=of_max_active_books,
+        of_max_spread_bps=of_max_spread_bps,
+        of_max_spread_ratio=of_max_spread_ratio,
+        of_depth_bps=of_depth_bps,
+        of_min_depth_ratio=of_min_depth_ratio,
+        of_max_data_age_seconds=of_max_data_age_seconds,
+        of_warmup_seconds=of_warmup_seconds,
+        of_min_edge_cost_multiple=of_min_edge_cost_multiple,
+        of_trend_efficiency_min=of_trend_efficiency_min,
+        of_adx_min=of_adx_min,
+        of_impulse_atr_multiple=of_impulse_atr_multiple,
+        of_impulse_spread_multiple=of_impulse_spread_multiple,
+        of_impulse_flow_min=of_impulse_flow_min,
+        of_impulse_volume_ratio_min=of_impulse_volume_ratio_min,
+        of_impulse_expiry_seconds=of_impulse_expiry_seconds,
+        of_pullback_min=of_pullback_min,
+        of_pullback_max=of_pullback_max,
+        of_pullback_min_seconds=of_pullback_min_seconds,
+        of_pullback_timeout_seconds=of_pullback_timeout_seconds,
+        of_book_imbalance_min=of_book_imbalance_min,
+        of_micro_bias_min=of_micro_bias_min,
+        of_trade_imbalance_2s_min=of_trade_imbalance_2s_min,
+        of_trade_imbalance_10s_min=of_trade_imbalance_10s_min,
+        of_confirmations_required=of_confirmations_required,
+        of_confirmation_window=of_confirmation_window,
+        of_min_score=of_min_score,
+        of_min_flow_score=of_min_flow_score,
+        of_min_book_score=of_min_book_score,
+        of_entry_timeout_seconds=of_entry_timeout_seconds,
+        of_max_chase_ticks=of_max_chase_ticks,
+        of_allow_market_fallback=of_allow_market_fallback,
+        of_stop_atr_fraction=of_stop_atr_fraction,
+        of_tp1_r=of_tp1_r,
+        of_tp1_size_pct=of_tp1_size_pct,
+        of_tp2_r=of_tp2_r,
+        of_continuation_timeout_seconds=of_continuation_timeout_seconds,
+        of_continuation_min_progress_r=of_continuation_min_progress_r,
+        of_max_hold_seconds=of_max_hold_seconds,
+        of_flow_scratch=of_flow_scratch,
+        of_flow_scratch_grace_seconds=of_flow_scratch_grace_seconds,
+        of_log_evaluations=of_log_evaluations,
+        scan_interval=scan_interval,
+        top_markets=top_markets,
+        size_pct_fraction=size_pct_fraction,
     )
     strategy = create_strategy(strategy_name, strategy_config)
 
     try:
         if owns_clients:
             account_address, info, exchange = await init_clients(use_testnet, use_websocket=use_websocket)
+        await strategy.start(info=info, account_address=account_address)
         metrics_start_time_ms = int(time.time() * 1000)
         risk_session = AutoRiskSessionState(started_ms=metrics_start_time_ms)
         coin_sessions: Dict[str, CoinTradeSessionState] = {}
@@ -2267,6 +2382,8 @@ async def run_auto_trader(
             managed_sl_trigger_px: Optional[float],
             managed_shortest_snapshot: Optional[AutoIntervalSignal],
             managed_log_context: Optional[Dict[str, Any]] = None,
+            managed_entry_retries: Optional[int] = None,
+            managed_market_fallback: Optional[bool] = None,
         ) -> AutoManagedTradeResult:
             trade_cycle_started_ms = now_ms()
             await run_bracket_entry(
@@ -2280,13 +2397,13 @@ async def run_auto_trader(
                 use_trailing_tp=use_trailing_tp,
                 trailing_tp_trigger_level=trailing_tp_trigger_level,
                 trailing_tp_profit_pct=trailing_tp_profit_pct,
-                entry_retries=entry_retries,
+                entry_retries=managed_entry_retries if managed_entry_retries is not None else entry_retries,
                 entry_repost_interval=entry_repost_interval,
                 poll_interval=poll_interval,
                 tp_reversal_pct=tp_reversal_pct,
                 entry_tif=entry_tif,
                 tp_tif=tp_tif,
-                market_fallback=market_fallback,
+                market_fallback=managed_market_fallback if managed_market_fallback is not None else market_fallback,
                 market_slippage=market_slippage,
                 cancel_existing_tpsl=cancel_existing_tpsl,
                 tp_reversal_limit_exit=tp_reversal_limit_exit,
@@ -2328,28 +2445,37 @@ async def run_auto_trader(
                     trade_result = task.result()
                 except asyncio.CancelledError:
                     print(f"[AUTO] Managed trade task for {finished_coin} was cancelled.")
+                    log_auto_trade_event(
+                        auto_trades_logger,
+                        "auto_trade_task_cancelled",
+                        coin=finished_coin,
+                    )
                     continue
                 except Exception as exc:
                     print(f"[AUTO-WARN] Managed trade task failed for {finished_coin}: {exc}")
                     logger.exception("[AUTO] Managed trade task failed for %s", finished_coin)
+                    log_auto_trade_event(
+                        auto_trades_logger,
+                        "auto_trade_task_failed",
+                        coin=finished_coin,
+                        error=str(exc),
+                    )
                     continue
 
                 completed_trades += 1
-                auto_trade_log_payload = _normalize_auto_log_value(
-                    {
-                        "event": "auto_trade_complete",
-                        "coin": trade_result.coin,
-                        "direction": trade_result.direction,
-                        "size": trade_result.size,
-                        "take_profit_pct": trade_result.take_profit_pct,
-                        "stop_loss_pct": trade_result.stop_loss_pct,
-                        "completed_trades": completed_trades,
-                        "started_ms": trade_result.started_ms,
-                        "closed_ms": trade_result.closed_ms,
-                        "signal_snapshot": trade_result.log_context,
-                    }
+                log_auto_trade_event(
+                    auto_trades_logger,
+                    "auto_trade_complete",
+                    coin=trade_result.coin,
+                    direction=trade_result.direction,
+                    size=trade_result.size,
+                    take_profit_pct=trade_result.take_profit_pct,
+                    stop_loss_pct=trade_result.stop_loss_pct,
+                    completed_trades=completed_trades,
+                    started_ms=trade_result.started_ms,
+                    closed_ms=trade_result.closed_ms,
+                    signal_snapshot=trade_result.log_context,
                 )
-                auto_trades_logger.info(json.dumps(auto_trade_log_payload, sort_keys=True))
 
                 if info is None or exchange is None:
                     raise RuntimeError("Initialized clients became unavailable while draining auto trade tasks.")
@@ -2504,7 +2630,17 @@ async def run_auto_trader(
             if coin is not None:
                 scan_coins = [coin]
             else:
-                ranked_markets = await get_top_perp_markets_by_volume(info, top_markets)
+                try:
+                    ranked_markets = await get_top_perp_markets_by_volume(info, top_markets)
+                except Exception as exc:
+                    if is_rate_limit_error(exc):
+                        await _sleep_after_rate_limit(
+                            "auto market ranking",
+                            exc,
+                            sleep_seconds=max(scan_interval, AUTO_RATE_LIMIT_BACKOFF_SECONDS),
+                        )
+                        continue
+                    raise
                 scan_coins = [market_coin for market_coin, _ in ranked_markets]
                 market_labels = ", ".join(f"{market_coin}({volume:.0f})" for market_coin, volume in ranked_markets)
                 print(f"[AUTO] Top volume scan set: {market_labels}")
@@ -2565,14 +2701,26 @@ async def run_auto_trader(
                     continue
 
             strategy_intervals = [trend_interval, entry_interval] if strategy.name == "reversal" else intervals
+            if strategy.name == "orderflow_pullback":
+                strategy_intervals = ["5m", "1m"]
             startup_backfill_state.set_expected_pairs(eligible_scan_coins, strategy_intervals)
             startup_backfill_state.begin_iteration()
 
-            shared_snapshot = await build_auto_scan_loop_snapshot(
-                info=info,
-                account_address=account_address,
-                metrics_start_time_ms=metrics_start_time_ms,
-            )
+            try:
+                shared_snapshot = await build_auto_scan_loop_snapshot(
+                    info=info,
+                    account_address=account_address,
+                    metrics_start_time_ms=metrics_start_time_ms,
+                )
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    await _sleep_after_rate_limit(
+                        "auto shared snapshot",
+                        exc,
+                        sleep_seconds=max(scan_interval, AUTO_RATE_LIMIT_BACKOFF_SECONDS),
+                    )
+                    continue
+                raise
             reserved_coins = set(active_trade_tasks.keys()) | set(shared_snapshot.positions_by_coin.keys())
             available_slots = max_positions - len(reserved_coins)
             if available_slots <= 0:
@@ -2623,10 +2771,32 @@ async def run_auto_trader(
 
                     if candidate.signal is None or candidate.strategy_context is None:
                         continue
+                    log_auto_trade_event(
+                        auto_trades_logger,
+                        "auto_trade_signal_detected",
+                        coin=candidate.coin,
+                        strategy=candidate.signal.strategy,
+                        direction=candidate.signal.direction,
+                        signal_score=candidate.signal.score,
+                        signal_candle_ms=candidate.signal.signal_candle_ms,
+                        reasons=list(candidate.signal.reasons),
+                        metadata=(
+                            dict(candidate.signal.metadata)
+                            if isinstance(candidate.signal.metadata, dict)
+                            else candidate.signal.metadata
+                        ),
+                    )
                     if candidate.coin in reserved_coins:
                         print(
                             f"[AUTO] {candidate.coin} is already reserved by an active position or managed task; "
                             f"skipping duplicate auto entry."
+                        )
+                        log_auto_trade_event(
+                            auto_trades_logger,
+                            "auto_trade_signal_skipped",
+                            coin=candidate.coin,
+                            strategy=candidate.signal.strategy,
+                            reason="coin_reserved",
                         )
                         continue
 
@@ -2635,12 +2805,20 @@ async def run_auto_trader(
                             info=info,
                             account_address=account_address,
                             coin=candidate.coin,
-                            side=candidate.decision.direction,
+                            side=candidate.signal.direction,
                             size=size,
                             size_pct=size_pct_fraction,
                         )
                     except Exception as exc:
                         print(f"[AUTO-WARN] {candidate.coin} size resolution failed; skipping trade candidate: {exc}")
+                        log_auto_trade_event(
+                            auto_trades_logger,
+                            "auto_trade_signal_skipped",
+                            coin=candidate.coin,
+                            strategy=candidate.signal.strategy,
+                            reason="size_resolution_failed",
+                            error=str(exc),
+                        )
                         continue
                     print(f"[AUTO] {candidate.coin} size resolved to {resolved_size:.8f} ({size_reason})")
                     launch_specs.append((candidate.coin, candidate.signal, candidate.strategy_context, resolved_size))
@@ -2669,6 +2847,11 @@ async def run_auto_trader(
                     f"blocking entries until {startup_backfill_state.remaining_pairs} "
                     f"coin/interval pair(s) finish loading."
                 )
+                log_auto_trade_event(
+                    auto_trades_logger,
+                    "auto_entries_blocked_startup_backfill",
+                    remaining_pairs=startup_backfill_state.remaining_pairs,
+                )
                 await _sleep_until_next_scan_batch()
                 continue
 
@@ -2683,88 +2866,147 @@ async def run_auto_trader(
                         f"[AUTO] Dry run enabled; {launch_coin} {launch_signal.strategy} "
                         f"{launch_signal.direction.upper()} signal will not be traded."
                     )
+                    log_auto_trade_event(
+                        auto_trades_logger,
+                        "auto_trade_signal_skipped",
+                        coin=launch_coin,
+                        strategy=launch_signal.strategy,
+                        direction=launch_signal.direction,
+                        reason="dry_run",
+                    )
                 await _sleep_until_next_scan_batch()
                 continue
 
             for launch_coin, launch_signal, launch_context, launch_size in launch_specs:
-                if launch_signal.strategy == "reversal":
-                    launch_signal = await normalize_signal_prices(info, launch_signal)
-                plan = strategy.build_execution_plan(launch_context, launch_signal, launch_size)
-                if plan.kind == "bracket_entry":
-                    auto_tp_pct = float(plan.metadata["take_profit_pct"])
-                    auto_sl_pct = plan.metadata.get("stop_loss_pct")
-                    auto_sl_trigger_px = (
-                        plan.metadata.get("stop_loss_trigger_px")
-                        if use_sar_stop_on_shortest_interval
-                        else None
-                    )
-                    sl_display = f"{auto_sl_pct * 100:.4f}%" if auto_sl_pct is not None else "N/A"
-                    print(
-                        f"[AUTO] Launching managed task for {plan.direction.upper()} {launch_coin}: size={launch_size:.8f}, "
-                        f"tp_pct={auto_tp_pct * 100:.4f}%, sl_pct={sl_display}, "
-                        f"sl_trigger={f'{auto_sl_trigger_px:.8f}' if auto_sl_trigger_px is not None else 'N/A'}"
-                    )
-                    log_context = _build_auto_trade_log_context(
-                        strategy_name=launch_signal.strategy,
-                        signal=launch_signal,
-                        strategy_context=launch_context,
-                        plan=plan,
-                        launch_size=launch_size,
-                    )
-                    active_trade_tasks[launch_coin] = asyncio.create_task(
-                        _run_managed_auto_trade(
-                            managed_coin=launch_coin,
-                            managed_direction=plan.direction,
-                            managed_size=launch_size,
-                            managed_tp_pct=auto_tp_pct,
-                            managed_sl_pct=auto_sl_pct,
-                            managed_sl_trigger_px=auto_sl_trigger_px,
-                            managed_shortest_snapshot=(
-                                SimpleNamespace(interval=plan.metadata.get("shortest_interval"))
-                                if plan.metadata.get("shortest_interval")
-                                else None
-                            ),
-                            managed_log_context=log_context,
+                try:
+                    if launch_signal.strategy == "reversal":
+                        launch_signal = await normalize_signal_prices(info, launch_signal)
+                    plan = strategy.build_execution_plan(launch_context, launch_signal, launch_size)
+                    if plan.kind == "bracket_entry":
+                        auto_tp_pct = float(plan.metadata["take_profit_pct"])
+                        auto_sl_pct = plan.metadata.get("stop_loss_pct")
+                        auto_sl_trigger_px = plan.metadata.get("stop_loss_trigger_px")
+                        plan_entry_retries = int(plan.metadata.get("entry_retries_override", entry_retries))
+                        plan_market_fallback = bool(plan.metadata.get("market_fallback_override", market_fallback))
+                        sl_display = f"{auto_sl_pct * 100:.4f}%" if auto_sl_pct is not None else "N/A"
+                        print(
+                            f"[AUTO] Launching managed task for {plan.direction.upper()} {launch_coin}: size={launch_size:.8f}, "
+                            f"tp_pct={auto_tp_pct * 100:.4f}%, sl_pct={sl_display}, "
+                            f"sl_trigger={f'{auto_sl_trigger_px:.8f}' if auto_sl_trigger_px is not None else 'N/A'}"
                         )
-                    )
-                else:
-                    # Reversal currently routes through the same guarded bracket-entry execution path.
-                    tp3 = plan.take_profit_prices[-1]
-                    if plan.direction == "long":
-                        take_profit_fraction = max(PRICE_EPS, (tp3 - plan.expected_entry) / plan.expected_entry)
-                        stop_loss_fraction = max(PRICE_EPS, (plan.expected_entry - plan.stop_price) / plan.expected_entry)
+                        log_context = _build_auto_trade_log_context(
+                            strategy_name=launch_signal.strategy,
+                            signal=launch_signal,
+                            strategy_context=launch_context,
+                            plan=plan,
+                            launch_size=launch_size,
+                        )
+                        log_auto_trade_event(
+                            auto_trades_logger,
+                            "auto_trade_launch",
+                            coin=launch_coin,
+                            strategy=launch_signal.strategy,
+                            direction=plan.direction,
+                            size=launch_size,
+                            execution_plan=log_context,
+                        )
+                        active_trade_tasks[launch_coin] = asyncio.create_task(
+                            _run_managed_auto_trade(
+                                managed_coin=launch_coin,
+                                managed_direction=plan.direction,
+                                managed_size=launch_size,
+                                managed_tp_pct=auto_tp_pct,
+                                managed_sl_pct=auto_sl_pct,
+                                managed_sl_trigger_px=auto_sl_trigger_px,
+                                managed_shortest_snapshot=(
+                                    SimpleNamespace(interval=plan.metadata.get("shortest_interval"))
+                                    if plan.metadata.get("shortest_interval")
+                                    else None
+                                ),
+                                managed_log_context=log_context,
+                                managed_entry_retries=plan_entry_retries,
+                                managed_market_fallback=plan_market_fallback,
+                            )
+                        )
                     else:
-                        take_profit_fraction = max(PRICE_EPS, (plan.expected_entry - tp3) / plan.expected_entry)
-                        stop_loss_fraction = max(PRICE_EPS, (plan.stop_price - plan.expected_entry) / plan.expected_entry)
-                    print(
-                        f"[AUTO] Launching reversal managed task for {plan.direction.upper()} {launch_coin}: "
-                        f"size={launch_size:.8f}, entry={plan.expected_entry:.8f}, stop={plan.stop_price:.8f}, "
-                        f"tp1={plan.take_profit_prices[0]:.8f}, tp2={plan.take_profit_prices[1]:.8f}, tp3={tp3:.8f}"
-                    )
-                    log_context = _build_auto_trade_log_context(
-                        strategy_name=launch_signal.strategy,
-                        signal=launch_signal,
-                        strategy_context=launch_context,
-                        plan=plan,
-                        launch_size=launch_size,
-                    )
-                    active_trade_tasks[launch_coin] = asyncio.create_task(
-                        _run_managed_auto_trade(
-                            managed_coin=launch_coin,
-                            managed_direction=plan.direction,
-                            managed_size=launch_size,
-                            managed_tp_pct=take_profit_fraction,
-                            managed_sl_pct=stop_loss_fraction,
-                            managed_sl_trigger_px=plan.stop_price,
-                            managed_shortest_snapshot=None,
-                            managed_log_context=log_context,
+                        if len(plan.take_profit_prices) < 3:
+                            raise RuntimeError(
+                                f"Reversal execution plan for {launch_coin} is missing take-profit targets: "
+                                f"{plan.take_profit_prices!r}"
+                            )
+                        # Reversal currently routes through the same guarded bracket-entry execution path.
+                        tp3 = plan.take_profit_prices[-1]
+                        if plan.direction == "long":
+                            take_profit_fraction = max(PRICE_EPS, (tp3 - plan.expected_entry) / plan.expected_entry)
+                            stop_loss_fraction = max(PRICE_EPS, (plan.expected_entry - plan.stop_price) / plan.expected_entry)
+                        else:
+                            take_profit_fraction = max(PRICE_EPS, (plan.expected_entry - tp3) / plan.expected_entry)
+                            stop_loss_fraction = max(PRICE_EPS, (plan.stop_price - plan.expected_entry) / plan.expected_entry)
+                        print(
+                            f"[AUTO] Launching reversal managed task for {plan.direction.upper()} {launch_coin}: "
+                            f"size={launch_size:.8f}, entry={plan.expected_entry:.8f}, stop={plan.stop_price:.8f}, "
+                            f"tp1={plan.take_profit_prices[0]:.8f}, tp2={plan.take_profit_prices[1]:.8f}, tp3={tp3:.8f}"
                         )
+                        log_context = _build_auto_trade_log_context(
+                            strategy_name=launch_signal.strategy,
+                            signal=launch_signal,
+                            strategy_context=launch_context,
+                            plan=plan,
+                            launch_size=launch_size,
+                        )
+                        log_auto_trade_event(
+                            auto_trades_logger,
+                            "auto_trade_launch",
+                            coin=launch_coin,
+                            strategy=launch_signal.strategy,
+                            direction=plan.direction,
+                            size=launch_size,
+                            execution_plan=log_context,
+                        )
+                        active_trade_tasks[launch_coin] = asyncio.create_task(
+                            _run_managed_auto_trade(
+                                managed_coin=launch_coin,
+                                managed_direction=plan.direction,
+                                managed_size=launch_size,
+                                managed_tp_pct=take_profit_fraction,
+                                managed_sl_pct=stop_loss_fraction,
+                                managed_sl_trigger_px=plan.stop_price,
+                                managed_shortest_snapshot=None,
+                                managed_log_context=log_context,
+                            )
+                        )
+                except Exception as exc:
+                    print(f"[AUTO-WARN] Failed to launch {launch_signal.strategy} signal for {launch_coin}: {exc}")
+                    logger.exception("[AUTO] Failed to launch %s signal for %s", launch_signal.strategy, launch_coin)
+                    log_auto_trade_event(
+                        auto_trades_logger,
+                        "auto_trade_launch_failed",
+                        coin=launch_coin,
+                        strategy=launch_signal.strategy,
+                        direction=launch_signal.direction,
+                        size=launch_size,
+                        error=str(exc),
+                        signal_snapshot={
+                            "signal_candle_ms": launch_signal.signal_candle_ms,
+                            "entry_price": launch_signal.entry_price,
+                            "stop_price": launch_signal.stop_price,
+                            "take_profit_prices": list(launch_signal.take_profit_prices),
+                            "score": launch_signal.score,
+                            "reasons": list(launch_signal.reasons),
+                            "metadata": (
+                                dict(launch_signal.metadata)
+                                if isinstance(launch_signal.metadata, dict)
+                                else launch_signal.metadata
+                            ),
+                        },
                     )
+                    continue
 
             metrics_start_time_ms = int(time.time() * 1000)
             await _sleep_until_next_scan_batch()
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, stopping auto trader.")
     finally:
+        await strategy.shutdown()
         if owns_clients:
             await close_clients(info, exchange)
