@@ -35,7 +35,7 @@ The canonical bot file in this repo is [`hypertrader.py`](/media/anon/developmen
 - Network access to Hyperliquid APIs
 - Account created with referral code [DARKEREGO](https://app.hyperliquid.xyz/join/DARKEREGO) (see account creation [*])
 
-Install from pip:
+Install from pip: https://pypi.org/project/hypertrader
 
 <pre>
 pip install hypertrader[auto] --upgrade
