@@ -61,6 +61,7 @@ from strategies.default import BollingerState, DefaultAutoStrategy, confirm_sign
 from strategies.orderflow_pullback import OrderflowPullbackStrategy
 from strategies.registry import available_strategies, available_strategy_names, create_strategy, normalize_strategy_name
 from strategies.reversal import ReversalAutoStrategy
+from strategies.fib_reversal import FibReversalStrategy, FIB_DEFAULTS, validate_fib_config
 
 
 def _make_candle(ts_ms: int, o: float, h: float, l: float, c: float, v: float = 100.0) -> dict[str, float]:
@@ -93,13 +94,40 @@ class AutoStrategyRegistryTests(unittest.TestCase):
         )
 
     def test_available_strategies_are_deterministic(self) -> None:
-        self.assertEqual(available_strategies(), ("default", "orderflow_pullback", "reversal"))
+        self.assertEqual(available_strategies(), ("default", "fib_reversal", "orderflow_pullback", "reversal"))
 
     def test_available_strategy_names_include_aliases(self) -> None:
         self.assertEqual(
             available_strategy_names(),
-            ("default", "legacy", "of_pullback", "orderflow", "orderflow_pullback", "reversal"),
+            ("default", "fib", "fib_reversal", "fibonacci", "legacy", "of_pullback", "orderflow", "orderflow_pullback", "reversal"),
         )
+
+    def test_fib_aliases_and_defaults(self) -> None:
+        for name in ("fib_reversal", "fib", "fibonacci"):
+            args = build_arg_parser().parse_args(["auto", "BTC", "--size-pct", "10", "--strategy", name])
+            self.assertEqual(args.strategy, name)
+            self.assertEqual(normalize_strategy_name(name), "fib_reversal")
+            self.assertIsInstance(create_strategy(name, args), FibReversalStrategy)
+            for key, value in FIB_DEFAULTS.items():
+                self.assertEqual(getattr(args, key), value)
+            validate_fib_config(args)
+
+    def test_fib_validation(self) -> None:
+        for key, value in FIB_DEFAULTS.items():
+            if isinstance(value, (bool, str)):
+                continue
+            for invalid in ((-1, float("nan"), float("inf")) if key == "fib_invalidation_atr" else (0, -1, float("nan"), float("inf"))):
+                args = types.SimpleNamespace(**{**FIB_DEFAULTS, key: invalid})
+                with self.subTest(key=key, value=invalid), self.assertRaises(ValueError):
+                    validate_fib_config(args)
+        for changes in ({"fib_entry_levels": ""}, {"fib_entry_levels": "0,1"},
+                        {"fib_macd_fast": 26}, {"fib_trend_ema_fast": 50},
+                        {"fib_strong_adx": 17}, {"fib_min_score": 11},
+                        {"fib_roc": False, "fib_min_score": 10}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_fib_config(types.SimpleNamespace(**{**FIB_DEFAULTS, **changes}))
+        args = build_arg_parser().parse_args(["auto", "BTC", "--size", "1", "--no-fib-roc"])
+        self.assertFalse(args.fib_roc)
 
     def test_auto_parser_defaults_to_default_strategy(self) -> None:
         parser = build_arg_parser()
@@ -139,7 +167,7 @@ class AutoStrategyRegistryTests(unittest.TestCase):
         self.assertEqual(normalize_strategy_name("of_pullback"), "orderflow_pullback")
 
     def test_registry_rejects_unknown_strategy_name(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Available strategies: default, orderflow_pullback, reversal"):
+        with self.assertRaisesRegex(ValueError, "Available strategies: default, fib_reversal, orderflow_pullback, reversal"):
             create_strategy("defualt", object())
 
     def test_default_decision_is_deterministic(self) -> None:

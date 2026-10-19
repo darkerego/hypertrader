@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from modes.position_management import run_bracket_entry
 from strategies.base import AutoStrategy, StrategyContext, StrategySignal
 from strategies.registry import create_strategy
 from strategies.reversal import normalize_signal_prices
-from utils.constants import AUTO_TRADES_LOG_FILE, INTERVAL_TO_MS, PRICE_EPS, cp
+from utils.constants import AUTO_TRADES_LOG_FILE, SIMULATED_LOG_FILE, INTERVAL_TO_MS, PRICE_EPS, cp
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
@@ -26,6 +27,7 @@ from utils.helpers import parse_interval_list, init_clients, _try_float, parse_f
 logger = logging.getLogger(__name__)
 _AUTO_TRADES_LOGGER: Optional[logging.Logger] = None
 AUTO_RATE_LIMIT_BACKOFF_SECONDS = 5.0
+AUTO_DRY_RUN_COLLATERAL = 10_000.0
 
 try:
     import numpy as np
@@ -35,9 +37,12 @@ except Exception:  # TA-Lib is only required for the auto command.
     talib = None  # type: ignore[assignment]
 
 
-def get_auto_trades_logger() -> logging.Logger:
+def get_auto_trades_logger(dry_run: bool = False) -> logging.Logger:
     """Return the dedicated auto-trade completion logger."""
     global _AUTO_TRADES_LOGGER
+
+    if dry_run:
+        return logging.getLogger("hypertrader.simulated")
 
     if _AUTO_TRADES_LOGGER is not None:
         return _AUTO_TRADES_LOGGER
@@ -237,6 +242,101 @@ class AutoManagedTradeResult:
     started_ms: int
     closed_ms: int
     log_context: Dict[str, Any] = field(default_factory=dict)
+    simulated_pnl: Optional[float] = None
+
+
+async def run_simulated_trade(info, plan, auto_logger, poll_interval):
+    """Paper fill at observed mids, honoring explicit TP allocations without orders.
+
+    PnL is gross quote-currency PnL: fees, funding, and slippage are not modeled.
+    Plans without TP allocations exit at the final target. Stops remain fixed.
+    """
+    direction = 1 if plan.direction == "long" else -1
+    if (not plan.take_profit_prices
+            or any(not math.isfinite(value) or value <= 0
+                   for value in (plan.size, plan.stop_price, *plan.take_profit_prices))):
+        raise ValueError("Simulation requires positive size, a stop, and take-profit targets")
+    allocations = plan.metadata.get("tp_allocations")
+    if allocations is not None:
+        if (len(allocations) != len(plan.take_profit_prices)
+                or any(not math.isfinite(value) or value <= 0 for value in allocations)
+                or not math.isclose(sum(allocations), 100.0)):
+            raise ValueError("Simulation TP allocations must match targets and sum to 100")
+        if any(direction * (b - a) <= 0
+               for a, b in zip(plan.take_profit_prices, plan.take_profit_prices[1:])):
+            raise ValueError("Simulation TP targets must be ordered in the trade direction")
+        targets = list(enumerate(zip(plan.take_profit_prices, allocations), start=1))
+    else:
+        targets = [(len(plan.take_profit_prices), (plan.take_profit_prices[-1], 100.0))]
+    started_ms = now_ms()
+    entry = None
+    last_price = None
+    remaining_size = plan.size
+    realized_pnl = 0.0
+    next_target = 0
+
+    def record(event, **payload):
+        log_auto_trade_event(
+            auto_logger, event, coin=plan.coin, simulated=True,
+            direction=plan.direction, size=plan.size, entry_price=entry,
+            stop_price=plan.stop_price, take_profit_prices=plan.take_profit_prices,
+            remaining_size=remaining_size, realized_pnl=realized_pnl,
+            pnl_basis="gross_excluding_fees_funding_slippage", **payload,
+        )
+
+    try:
+        while True:
+            try:
+                mids = await get_all_mids(info)
+                price = float(mids.get(plan.coin, 0))
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError(f"No valid market price for {plan.coin}")
+            except Exception as exc:
+                record("simulated_price_unavailable", error=str(exc))
+                await asyncio.sleep(poll_interval)
+                continue
+            last_price = price
+            if entry is None:
+                entry = price
+                record("simulated_position_entered", started_ms=started_ms, unrealized_pnl=0.0)
+            stop_hit = direction * (price - plan.stop_price) <= 0
+            if stop_hit:
+                realized_pnl += direction * (price - entry) * remaining_size
+                remaining_size = 0.0
+            else:
+                while next_target < len(targets):
+                    level, (target_price, allocation) = targets[next_target]
+                    if direction * (price - target_price) < 0:
+                        break
+                    # The last target consumes any floating-point remainder.
+                    exit_size = (remaining_size if next_target == len(targets) - 1 else
+                                 min(remaining_size, plan.size * allocation / 100.0))
+                    fill_pnl = direction * (price - entry) * exit_size
+                    realized_pnl += fill_pnl
+                    remaining_size = max(0.0, remaining_size - exit_size)
+                    next_target += 1
+                    record("simulated_take_profit_filled", level=level, target_price=target_price,
+                           exit_price=price, exit_size=exit_size, fill_pnl=fill_pnl)
+            if remaining_size == 0:
+                closed_ms = now_ms()
+                record("simulated_position_exited", exit_price=price,
+                       reason="stop_loss" if stop_hit else "take_profit", closed_ms=closed_ms)
+                return AutoManagedTradeResult(
+                    coin=plan.coin, direction=plan.direction, size=plan.size,
+                    take_profit_pct=abs(plan.take_profit_prices[-1] - entry) / entry,
+                    stop_loss_pct=abs(plan.stop_price - entry) / entry,
+                    started_ms=started_ms, closed_ms=closed_ms, simulated_pnl=realized_pnl,
+                    log_context={"simulated": True, "entry_price": entry,
+                                 "exit_price": price, "realized_pnl": realized_pnl},
+                )
+            record("simulated_position_mark", mark_price=price,
+                   unrealized_pnl=direction * (price - entry) * remaining_size)
+            await asyncio.sleep(poll_interval)
+    except asyncio.CancelledError:
+        if entry is not None:
+            record("simulated_position_open_at_shutdown", mark_price=last_price,
+                   unrealized_pnl=direction * (last_price - entry) * remaining_size)
+        raise
 
 
 @dataclass
@@ -991,8 +1091,17 @@ async def build_auto_scan_loop_snapshot(
     info: Info,
     account_address: str,
     metrics_start_time_ms: int,
+    dry_run: bool = False,
 ) -> AutoScanLoopSnapshot:
     """Fetch shared scan-loop state once to avoid per-market REST duplication."""
+    if dry_run:
+        return AutoScanLoopSnapshot(
+            mids=await get_all_mids(info),
+            positions_by_coin={},
+            account_balance=AUTO_DRY_RUN_COLLATERAL,
+            realized_pnl=0.0,
+        )
+
     user_state = await get_user_state_with_retry(
         info,
         account_address,
@@ -1396,21 +1505,24 @@ async def get_instrument_leverage_for_size_pct(
     info: Info,
     account_address: str,
     coin: str,
+    dry_run: bool = False,
 ) -> Tuple[Optional[decimal.Decimal], str]:
-    """Return leverage for manual --size-pct fallback sizing."""
-    try:
-        active_asset_data = await post_active_asset_data(info, account_address, coin)
-    except Exception as exc:
-        active_asset_data = None
-        active_asset_reason = f"activeAssetData request failed: {exc}"
+    """Use public leverage limits in dry runs, account leverage otherwise."""
+    if dry_run:
+        active_asset_reason = "dry_run_public_leverage"
     else:
-        if isinstance(active_asset_data, dict):
-            leverage_value, leverage_source = _extract_active_asset_data_leverage(active_asset_data)
-            if leverage_value is not None:
-                return leverage_value, leverage_source
-            active_asset_reason = leverage_source
+        try:
+            active_asset_data = await post_active_asset_data(info, account_address, coin)
+        except Exception as exc:
+            active_asset_reason = f"activeAssetData request failed: {exc}"
         else:
-            active_asset_reason = f"activeAssetData returned {type(active_asset_data).__name__}, expected dict"
+            if isinstance(active_asset_data, dict):
+                leverage_value, leverage_source = _extract_active_asset_data_leverage(active_asset_data)
+                if leverage_value is not None:
+                    return leverage_value, leverage_source
+                active_asset_reason = leverage_source
+            else:
+                active_asset_reason = f"activeAssetData returned {type(active_asset_data).__name__}, expected dict"
 
     try:
         dex, _ = split_hyperliquid_market_id(coin)
@@ -1454,6 +1566,7 @@ async def resolve_auto_trade_size(
     side: str,
     size: Optional[float],
     size_pct: Optional[Any],
+    dry_run: bool = False,
 ) -> Tuple[float, str]:
     """Resolve auto-trade size from explicit size or available-collateral percentage."""
     if size is not None:
@@ -1465,23 +1578,28 @@ async def resolve_auto_trade_size(
         raise RuntimeError("Specify either --size or --size-pct.")
     size_pct_fraction = parse_fractional_pct(size_pct, field_name="--size-pct")
 
-    active_asset_size, active_asset_reason = await resolve_size_pct_from_active_asset_data(
-        info=info,
-        account_address=account_address,
-        coin=coin,
-        side=side,
-        size_pct_fraction=size_pct_fraction,
-    )
-    if active_asset_size is not None:
-        return active_asset_size, active_asset_reason
+    if dry_run:
+        available_collateral = AUTO_DRY_RUN_COLLATERAL
+        collateral_source = "dry_run_cUSDC"
+        active_asset_reason = "dry_run_assumed_collateral"
+    else:
+        active_asset_size, active_asset_reason = await resolve_size_pct_from_active_asset_data(
+            info=info,
+            account_address=account_address,
+            coin=coin,
+            side=side,
+            size_pct_fraction=size_pct_fraction,
+        )
+        if active_asset_size is not None:
+            return active_asset_size, active_asset_reason
 
-    user_state = await get_user_state_with_retry(
-        info,
-        account_address,
-        context_label="resolve_auto_trade_size",
-        coin=coin,
-    )
-    available_collateral, collateral_source = extract_available_collateral_from_user_state(user_state)
+        user_state = await get_user_state_with_retry(
+            info,
+            account_address,
+            context_label="resolve_auto_trade_size",
+            coin=coin,
+        )
+        available_collateral, collateral_source = extract_available_collateral_from_user_state(user_state)
     if available_collateral is None or available_collateral <= 0.0:
         raise RuntimeError("Could not determine available collateral for --size-pct sizing.")
 
@@ -1497,6 +1615,7 @@ async def resolve_auto_trade_size(
         info=info,
         account_address=account_address,
         coin=coin,
+        dry_run=dry_run,
     )
     if leverage_dec is None or leverage_dec <= 0:
         raise RuntimeError(
@@ -1926,7 +2045,7 @@ async def scan_auto_trade_candidate(
 
     interval_candles: Dict[str, List[Dict[str, Any]]] = {}
     required_intervals: List[str]
-    if strategy.name == "reversal":
+    if strategy.name in ("reversal", "fib_reversal"):
         required_intervals = [str(strategy_config.trend_interval), str(strategy_config.entry_interval)]
     elif strategy.name == "orderflow_pullback":
         required_intervals = ["5m", "1m"]
@@ -1941,7 +2060,7 @@ async def scan_auto_trade_candidate(
                 info,
                 scan_coin,
                 interval,
-                int(strategy_config.reversal_history_periods if strategy.name == "reversal" else strategy_config.periods),
+                int(strategy_config.fib_history_periods if strategy.name == "fib_reversal" else strategy_config.reversal_history_periods if strategy.name == "reversal" else strategy_config.periods),
                 use_websocket_candles=use_websocket_candles,
             )
         except Exception as exc:
@@ -2055,6 +2174,29 @@ async def run_auto_trader(
     risk_session_log: str = "",
     trend_interval: str = "1h",
     entry_interval: str = "15m",
+    fib_entry_levels: str | tuple[float, ...] = '0.382,0.5,0.618',
+    fib_pivot_width: int = 2,
+    fib_impulse_lookback: int = 120,
+    fib_min_impulse_atr: float = 2.0,
+    fib_min_impulse_bars: int = 5,
+    fib_zone_atr: float = 0.15,
+    fib_invalidation_atr: float = 0.1,
+    fib_stop_atr_buffer: float = 0.25,
+    fib_max_entry_distance_atr: float = 0.5,
+    fib_atr_period: int = 14,
+    fib_macd_fast: int = 12,
+    fib_macd_slow: int = 26,
+    fib_macd_signal: int = 9,
+    fib_adx_period: int = 14,
+    fib_min_adx: float = 18.0,
+    fib_strong_adx: float = 25.0,
+    fib_roc_period: int = 9,
+    fib_roc: bool = True,
+    fib_trend_ema_fast: int = 20,
+    fib_trend_ema_slow: int = 50,
+    fib_confirm_timeout: int = 4,
+    fib_min_score: int = 5,
+    fib_min_rr: float = 1.5,
     reversal_ema_fast: int = 9,
     reversal_ema_confirm: int = 21,
     reversal_ema_trend_fast: int = 20,
@@ -2213,7 +2355,9 @@ async def run_auto_trader(
         raise RuntimeError("Pass account_address, info, and exchange together when reusing initialized clients.")
     completed_trades = 0
     _iter = 0
-    auto_trades_logger = get_auto_trades_logger()
+    auto_trades_logger = get_auto_trades_logger(dry_run=dry_run)
+    if dry_run:
+        risk_session_log = SIMULATED_LOG_FILE
     startup_backfill_state = AutoStartupBackfillState(enabled=True)
     strategy_config = SimpleNamespace(
         strategy_name=strategy_name,
@@ -2238,6 +2382,30 @@ async def run_auto_trader(
         use_sar_stop_on_shortest_interval=use_sar_stop_on_shortest_interval,
         trend_interval=trend_interval,
         entry_interval=entry_interval,
+        fib_entry_levels=fib_entry_levels,
+        fib_pivot_width=fib_pivot_width,
+        fib_impulse_lookback=fib_impulse_lookback,
+        fib_min_impulse_atr=fib_min_impulse_atr,
+        fib_min_impulse_bars=fib_min_impulse_bars,
+        fib_zone_atr=fib_zone_atr,
+        fib_invalidation_atr=fib_invalidation_atr,
+        fib_stop_atr_buffer=fib_stop_atr_buffer,
+        fib_max_entry_distance_atr=fib_max_entry_distance_atr,
+        fib_atr_period=fib_atr_period,
+        fib_macd_fast=fib_macd_fast,
+        fib_macd_slow=fib_macd_slow,
+        fib_macd_signal=fib_macd_signal,
+        fib_adx_period=fib_adx_period,
+        fib_min_adx=fib_min_adx,
+        fib_strong_adx=fib_strong_adx,
+        fib_roc_period=fib_roc_period,
+        fib_roc=fib_roc,
+        fib_trend_ema_fast=fib_trend_ema_fast,
+        fib_trend_ema_slow=fib_trend_ema_slow,
+        fib_confirm_timeout=fib_confirm_timeout,
+        fib_min_score=fib_min_score,
+        fib_min_rr=fib_min_rr,
+        fib_history_periods=max(periods, fib_impulse_lookback + fib_atr_period + 2 * fib_pivot_width + 1, fib_trend_ema_slow + 3, fib_macd_slow + fib_macd_signal + 3, 2 * fib_adx_period + 3, fib_roc_period + 3),
         reversal_ema_fast=reversal_ema_fast,
         reversal_ema_confirm=reversal_ema_confirm,
         reversal_ema_trend_fast=reversal_ema_trend_fast,
@@ -2358,6 +2526,8 @@ async def run_auto_trader(
         print(f"Scan concurrency:   {max_concurrent_scans}")
         print(f"Max positions:      {max_positions}")
         print(f"Dry run:            {dry_run}")
+        if dry_run:
+            print(f"Dry-run collateral: {AUTO_DRY_RUN_COLLATERAL:,.2f} cUSDC")
         print(f"Max trades:         {'unlimited' if max_trades == 0 else max_trades}")
         print(f"Loop after trade:   {loop_after_trade}")
         print("Coin risk controls:")
@@ -2384,6 +2554,8 @@ async def run_auto_trader(
             managed_log_context: Optional[Dict[str, Any]] = None,
             managed_entry_retries: Optional[int] = None,
             managed_market_fallback: Optional[bool] = None,
+            managed_tp_prices: Optional[tuple[float, ...]] = None,
+            managed_tp_allocations: Optional[tuple[float, ...]] = None,
         ) -> AutoManagedTradeResult:
             trade_cycle_started_ms = now_ms()
             await run_bracket_entry(
@@ -2394,6 +2566,7 @@ async def run_auto_trader(
                 stop_loss_pct=managed_sl_pct,
                 stop_loss_trigger_px=managed_sl_trigger_px,
                 take_profit_levels=take_profit_levels,
+                **({"take_profit_prices": managed_tp_prices, "tp_allocations": managed_tp_allocations} if managed_tp_prices else {}),
                 use_trailing_tp=use_trailing_tp,
                 trailing_tp_trigger_level=trailing_tp_trigger_level,
                 trailing_tp_profit_pct=trailing_tp_profit_pct,
@@ -2480,13 +2653,16 @@ async def run_auto_trader(
                 if info is None or exchange is None:
                     raise RuntimeError("Initialized clients became unavailable while draining auto trade tasks.")
 
-                cycle_pnl, cycle_fills, pnl_reason = await fetch_trade_cycle_net_pnl(
-                    info=info,
-                    account_address=account_address,
-                    coin=trade_result.coin,
-                    start_time_ms=trade_result.started_ms,
-                    end_time_ms=trade_result.closed_ms,
-                )
+                if dry_run:
+                    cycle_pnl, cycle_fills, pnl_reason = trade_result.simulated_pnl, [], None
+                else:
+                    cycle_pnl, cycle_fills, pnl_reason = await fetch_trade_cycle_net_pnl(
+                        info=info,
+                        account_address=account_address,
+                        coin=trade_result.coin,
+                        start_time_ms=trade_result.started_ms,
+                        end_time_ms=trade_result.closed_ms,
+                    )
                 if pnl_reason:
                     print(
                         f"[AUTO-WARN] {trade_result.coin} post-trade PnL unavailable; "
@@ -2643,7 +2819,7 @@ async def run_auto_trader(
                     raise
                 scan_coins = [market_coin for market_coin, _ in ranked_markets]
                 market_labels = ", ".join(f"{market_coin}({volume:.0f})" for market_coin, volume in ranked_markets)
-                print(f"[AUTO] Top volume scan set: {market_labels}")
+                print(f"[AUTO] Top volume scan set: {market_labels}", file=sys.stderr)
                 if not scan_coins:
                     print("[AUTO-WARN] No perp markets with usable volume data were returned.")
                     await asyncio.sleep(scan_interval)
@@ -2700,7 +2876,7 @@ async def run_auto_trader(
                     await asyncio.sleep(scan_interval)
                     continue
 
-            strategy_intervals = [trend_interval, entry_interval] if strategy.name == "reversal" else intervals
+            strategy_intervals = [trend_interval, entry_interval] if strategy.name in ("reversal", "fib_reversal") else intervals
             if strategy.name == "orderflow_pullback":
                 strategy_intervals = ["5m", "1m"]
             startup_backfill_state.set_expected_pairs(eligible_scan_coins, strategy_intervals)
@@ -2711,6 +2887,7 @@ async def run_auto_trader(
                     info=info,
                     account_address=account_address,
                     metrics_start_time_ms=metrics_start_time_ms,
+                    dry_run=dry_run,
                 )
             except Exception as exc:
                 if is_rate_limit_error(exc):
@@ -2808,6 +2985,7 @@ async def run_auto_trader(
                             side=candidate.signal.direction,
                             size=size,
                             size_pct=size_pct_fraction,
+                            dry_run=dry_run,
                         )
                     except Exception as exc:
                         print(f"[AUTO-WARN] {candidate.coin} size resolution failed; skipping trade candidate: {exc}")
@@ -2856,32 +3034,20 @@ async def run_auto_trader(
                 continue
 
             if not launch_specs:
-                print('=' * 40 + f'Iteration: {_iter}, sleeping {scan_interval} seconds (--scan-interval).' + '=' * 40)
-                await _sleep_until_next_scan_batch()
-                continue
-
-            if dry_run:
-                for launch_coin, launch_signal, _launch_context, _launch_size in launch_specs:
-                    print(
-                        f"[AUTO] Dry run enabled; {launch_coin} {launch_signal.strategy} "
-                        f"{launch_signal.direction.upper()} signal will not be traded."
-                    )
-                    log_auto_trade_event(
-                        auto_trades_logger,
-                        "auto_trade_signal_skipped",
-                        coin=launch_coin,
-                        strategy=launch_signal.strategy,
-                        direction=launch_signal.direction,
-                        reason="dry_run",
-                    )
+                print('=' * 40 + f'Iteration: {_iter}, sleeping {scan_interval} seconds (--scan-interval).' + '=' * 40, file=sys.stderr)
                 await _sleep_until_next_scan_batch()
                 continue
 
             for launch_coin, launch_signal, launch_context, launch_size in launch_specs:
                 try:
-                    if launch_signal.strategy == "reversal":
+                    if launch_signal.strategy in ("reversal", "fib_reversal"):
                         launch_signal = await normalize_signal_prices(info, launch_signal)
                     plan = strategy.build_execution_plan(launch_context, launch_signal, launch_size)
+                    if dry_run:
+                        active_trade_tasks[launch_coin] = asyncio.create_task(
+                            run_simulated_trade(info, plan, auto_trades_logger, poll_interval)
+                        )
+                        continue
                     if plan.kind == "bracket_entry":
                         auto_tp_pct = float(plan.metadata["take_profit_pct"])
                         auto_sl_pct = plan.metadata.get("stop_loss_pct")
@@ -2971,6 +3137,8 @@ async def run_auto_trader(
                                 managed_tp_pct=take_profit_fraction,
                                 managed_sl_pct=stop_loss_fraction,
                                 managed_sl_trigger_px=plan.stop_price,
+                                managed_tp_prices=plan.take_profit_prices if launch_signal.strategy == "fib_reversal" else None,
+                                managed_tp_allocations=tuple(plan.metadata["tp_allocations"]) if launch_signal.strategy == "fib_reversal" else None,
                                 managed_shortest_snapshot=None,
                                 managed_log_context=log_context,
                             )
@@ -3007,6 +3175,11 @@ async def run_auto_trader(
     except KeyboardInterrupt:
         print("\n[!] Caught Ctrl+C, stopping auto trader.")
     finally:
+        if dry_run:
+            tasks = list(locals().get("active_trade_tasks", {}).values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         await strategy.shutdown()
         if owns_clients:
             await close_clients(info, exchange)

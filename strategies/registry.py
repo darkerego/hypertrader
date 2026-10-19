@@ -4,12 +4,15 @@ from collections.abc import Callable
 
 from strategies.base import AutoStrategy
 from strategies.default import DefaultAutoStrategy
+from strategies.fib_reversal import FibReversalStrategy
 from strategies.orderflow_pullback import OrderflowPullbackStrategy
 from strategies.reversal import ReversalAutoStrategy
 
 StrategyFactory = Callable[[object], AutoStrategy]
 
 _ALIASES: dict[str, str] = {
+    "fib": "fib_reversal",
+    "fibonacci": "fib_reversal",
     "legacy": "default",
     "of_pullback": "orderflow_pullback",
     "orderflow": "orderflow_pullback",
@@ -17,6 +20,7 @@ _ALIASES: dict[str, str] = {
 
 _STRATEGIES: dict[str, StrategyFactory] = {
     "default": DefaultAutoStrategy,
+    "fib_reversal": FibReversalStrategy,
     "orderflow_pullback": OrderflowPullbackStrategy,
     "reversal": ReversalAutoStrategy,
 }

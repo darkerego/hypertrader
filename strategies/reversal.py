@@ -965,7 +965,7 @@ async def normalize_signal_prices(
     from utils.helpers import round_price_for_hyperliquid
 
     stop_price = await round_price_for_hyperliquid(info, signal.coin, signal.stop_price)
-    tp_prices = tuple(await round_price_for_hyperliquid(info, signal.coin, price) for price in signal.take_profit_prices)
+    tp_prices = tuple([await round_price_for_hyperliquid(info, signal.coin, price) for price in signal.take_profit_prices])
     entry_price = await round_price_for_hyperliquid(info, signal.coin, signal.entry_price)
     return StrategySignal(
         strategy=signal.strategy,

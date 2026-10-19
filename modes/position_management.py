@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -1171,6 +1172,8 @@ async def monitor_bracket_position(
         auto_sar_maximum: Optional[float] = None,
         auto_use_last_closed_candle: bool = True,
         auto_use_websocket_candles: bool = False,
+        take_profit_prices: Optional[Tuple[float, ...]] = None,
+        tp_allocations: Optional[Tuple[float, ...]] = None,
 ) -> None:
     """Monitor bracket orders, display PnL/account metrics, and manage hidden/public TP/SL."""
     if poll_interval <= 0.0:
@@ -1292,6 +1295,7 @@ async def monitor_bracket_position(
                         f"Rebuilding {'hidden ' if hide_orders else ''}TP/SL from avg entry {live_entry_px:.8f}."
                     )
                     stop_oid, tp_orders, tp_oids, tp_trigger_px = await rebuild_bracket_orders(
+                        **({"take_profit_prices": take_profit_prices, "tp_allocations": tp_allocations} if take_profit_prices else {}),
                         info=info,
                         exchange=exchange,
                         account_address=account_address,
@@ -1706,6 +1710,8 @@ async def build_take_profit_ladder(
         entry_px: float,
         take_profit_pct: float,
         levels: int,
+        take_profit_prices: Optional[Tuple[float, ...]] = None,
+        tp_allocations: Optional[Tuple[float, ...]] = None,
 ) -> List[Dict[str, Any]]:
     """Build weighted TP limit orders that sum to the full position."""
     if not (0.0 < take_profit_pct < 1.0):
@@ -1714,7 +1720,18 @@ async def build_take_profit_ladder(
         raise RuntimeError("take-profit levels must be > 0")
 
     exit_is_buy = side == "short"
-    weights = list(range(1, levels + 1))
+    if take_profit_prices is not None:
+        if not take_profit_prices or tp_allocations is None or len(tp_allocations) != len(take_profit_prices):
+            raise RuntimeError("Explicit TP prices require matching allocations")
+        if any(not math.isfinite(v) or v <= 0 for v in (*take_profit_prices, *tp_allocations)):
+            raise RuntimeError("TP prices and allocations must be finite and positive")
+        if not math.isclose(sum(tp_allocations), 100.0):
+            raise RuntimeError("TP allocations must sum to 100")
+        sign = 1 if side == "long" else -1
+        if any(sign * (b - a) <= 0 for a, b in zip(take_profit_prices, take_profit_prices[1:])):
+            raise RuntimeError("Explicit TP prices must be ordered in the trade direction")
+        levels = len(take_profit_prices)
+    weights = list(tp_allocations) if take_profit_prices is not None else list(range(1, levels + 1))
     weight_sum = float(sum(weights))
     raw_sizes = [position_size_abs * (weight / weight_sum) for weight in weights]
 
@@ -1733,6 +1750,8 @@ async def build_take_profit_ladder(
         fraction = idx / levels
         raw_px = entry_px * (1.0 + take_profit_pct * fraction) if side == "long" else entry_px * (
                     1.0 - take_profit_pct * fraction)
+        if take_profit_prices is not None:
+            raw_px = take_profit_prices[idx - 1]
         px = await round_price_for_hyperliquid(info, coin, raw_px)
         orders.append({"coin": coin, "is_buy": exit_is_buy, "sz": sz, "px": px, "level": idx})
 
@@ -1757,6 +1776,8 @@ async def rebuild_bracket_orders(
         hide_orders: bool = False,
         use_trailing_tp: bool = False,
         trailing_tp_profit_pct: float = 0.25,
+        take_profit_prices: Optional[Tuple[float, ...]] = None,
+        tp_allocations: Optional[Tuple[float, ...]] = None,
 ) -> Tuple[Optional[int], List[Dict[str, Any]], List[int], Optional[float]]:
     """Place or prepare reduce-only TP/SL orders for the current live position.
 
@@ -1774,6 +1795,7 @@ async def rebuild_bracket_orders(
 
     if take_profit_pct is not None:
         tp_orders = await build_take_profit_ladder(
+            **({"take_profit_prices": take_profit_prices, "tp_allocations": tp_allocations} if take_profit_prices else {}),
             info=info,
             coin=coin,
             side=side,
@@ -1860,6 +1882,8 @@ async def run_bracket_entry(
         account_address: Optional[str] = None,
         info: Optional[Info] = None,
         exchange: Optional[Exchange] = None,
+        take_profit_prices: Optional[Tuple[float, ...]] = None,
+        tp_allocations: Optional[Tuple[float, ...]] = None,
 ) -> None:
     """Enter a position and manage bracket protection/exit logic."""
     direction = direction.lower().strip()
@@ -1955,6 +1979,7 @@ async def run_bracket_entry(
         print(f"[OPEN] {coin} {side.upper()} size={pos_abs:.8f}, signed={current_size:.8f}, entry={entry_px:.8f}")
 
         stop_oid, tp_orders, tp_oids, _ = await rebuild_bracket_orders(
+            **({"take_profit_prices": take_profit_prices, "tp_allocations": tp_allocations} if take_profit_prices else {}),
             info=info,
             exchange=exchange,
             account_address=account_address,
@@ -1975,6 +2000,7 @@ async def run_bracket_entry(
         )
 
         await monitor_bracket_position(
+            **({"take_profit_prices": take_profit_prices, "tp_allocations": tp_allocations} if take_profit_prices else {}),
             info=info,
             exchange=exchange,
             account_address=account_address,

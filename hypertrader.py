@@ -23,6 +23,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from strategies.fib_reversal import validate_fib_config
 from strategies.registry import available_strategy_names, available_strategies, normalize_strategy_name
 
 from hyperliquid.info import Info
@@ -31,7 +32,7 @@ from modes.market_maker import run_market_maker
 from modes.position_management import run_bracket_entry
 from modes.position_watcher import run_position_watcher
 from modes.trailing_stop import trailing_stop_for_all_positions
-from utils.constants import DEFAULT_LOG_FILE, INTERVAL_TO_MS
+from utils.constants import DEFAULT_LOG_FILE, SIMULATED_LOG_FILE, INTERVAL_TO_MS
 from utils.helpers import parse_fractional_pct, normalize_hyperliquid_market_id, split_hyperliquid_market_id
 from utils.style import install_pretty_stdout
 
@@ -335,7 +336,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Slippage fraction for market-style entry/exit. Default: 0.05.")
     auto_parser.add_argument("--keep-existing-tpsl", action="store_true",
                              help="Do not cancel existing reduce-only TP/SL orders before entry.")
-    auto_parser.add_argument("--dry-run", action="store_true", help="Print auto signals but do not enter trades.")
+    auto_parser.add_argument("--dry-run", action="store_true", help="Simulate positions using 10,000 cUSDC assumed collateral and log to logs/simulated.log.")
     auto_parser.add_argument("--max-trades", type=int, default=0,
                              help="Maximum completed auto trades before exit. 0 means unlimited. Default: 0.")
     auto_parser.add_argument("--cooldown-after-trade", type=float, default=60.0,
@@ -372,6 +373,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              help="Disable ws for kline data (not recommended): ")
     auto_parser.add_argument("--hide-orders", "-ho", action="store_true",
                              help="Keep auto-mode TP/SL targets private; no exchange-side bracket orders are placed until targets trigger.")
+    fib_group = auto_parser.add_argument_group("Fibonacci reversal strategy")
+    fib_group.add_argument("--fib-entry-levels", type=str, default='0.382,0.5,0.618')
+    fib_group.add_argument("--fib-pivot-width", type=int, default=2)
+    fib_group.add_argument("--fib-impulse-lookback", type=int, default=120)
+    fib_group.add_argument("--fib-min-impulse-atr", type=float, default=2.0)
+    fib_group.add_argument("--fib-min-impulse-bars", type=int, default=5)
+    fib_group.add_argument("--fib-zone-atr", type=float, default=0.15)
+    fib_group.add_argument("--fib-invalidation-atr", type=float, default=0.1)
+    fib_group.add_argument("--fib-stop-atr-buffer", type=float, default=0.25)
+    fib_group.add_argument("--fib-max-entry-distance-atr", type=float, default=0.5)
+    fib_group.add_argument("--fib-atr-period", type=int, default=14)
+    fib_group.add_argument("--fib-macd-fast", type=int, default=12)
+    fib_group.add_argument("--fib-macd-slow", type=int, default=26)
+    fib_group.add_argument("--fib-macd-signal", type=int, default=9)
+    fib_group.add_argument("--fib-adx-period", type=int, default=14)
+    fib_group.add_argument("--fib-min-adx", type=float, default=18.0)
+    fib_group.add_argument("--fib-strong-adx", type=float, default=25.0)
+    fib_group.add_argument("--fib-roc-period", type=int, default=9)
+    fib_group.add_argument("--no-fib-roc", dest="fib_roc", action="store_false", default=True)
+    fib_group.add_argument("--fib-trend-ema-fast", type=int, default=20)
+    fib_group.add_argument("--fib-trend-ema-slow", type=int, default=50)
+    fib_group.add_argument("--fib-confirm-timeout", type=int, default=4)
+    fib_group.add_argument("--fib-min-score", type=int, default=5)
+    fib_group.add_argument("--fib-min-rr", type=float, default=1.5)
+
     reversal_group = auto_parser.add_argument_group("Reversal strategy")
     reversal_group.add_argument("--trend-interval", type=str, default="1h",
                                 help="Higher timeframe used for reversal trend classification. Default: 1h.")
@@ -716,6 +742,18 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
         if args.ws_candles and args.no_websocket:
             print("[ERROR] --ws-candles requires websocket market data; remove --no-websocket.")
             sys.exit(1)
+        try:
+            validate_fib_config(args)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
+        if args.strategy == "fib_reversal":
+            if args.trend_interval not in INTERVAL_TO_MS or args.entry_interval not in INTERVAL_TO_MS:
+                print("[ERROR] Unsupported Fibonacci trend/entry interval.")
+                sys.exit(1)
+            if INTERVAL_TO_MS[args.entry_interval] >= INTERVAL_TO_MS[args.trend_interval]:
+                print("[ERROR] --entry-interval must be shorter than --trend-interval for fib_reversal.")
+                sys.exit(1)
         if args.strategy == "reversal":
             if args.trend_interval not in INTERVAL_TO_MS:
                 print(f"[ERROR] Unsupported --trend-interval {args.trend_interval!r}.")
@@ -858,6 +896,29 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
             risk_session_log=args.risk_session_log,
             trend_interval=args.trend_interval,
             entry_interval=args.entry_interval,
+            fib_entry_levels=args.fib_entry_levels,
+            fib_pivot_width=args.fib_pivot_width,
+            fib_impulse_lookback=args.fib_impulse_lookback,
+            fib_min_impulse_atr=args.fib_min_impulse_atr,
+            fib_min_impulse_bars=args.fib_min_impulse_bars,
+            fib_zone_atr=args.fib_zone_atr,
+            fib_invalidation_atr=args.fib_invalidation_atr,
+            fib_stop_atr_buffer=args.fib_stop_atr_buffer,
+            fib_max_entry_distance_atr=args.fib_max_entry_distance_atr,
+            fib_atr_period=args.fib_atr_period,
+            fib_macd_fast=args.fib_macd_fast,
+            fib_macd_slow=args.fib_macd_slow,
+            fib_macd_signal=args.fib_macd_signal,
+            fib_adx_period=args.fib_adx_period,
+            fib_min_adx=args.fib_min_adx,
+            fib_strong_adx=args.fib_strong_adx,
+            fib_roc_period=args.fib_roc_period,
+            fib_roc=args.fib_roc,
+            fib_trend_ema_fast=args.fib_trend_ema_fast,
+            fib_trend_ema_slow=args.fib_trend_ema_slow,
+            fib_confirm_timeout=args.fib_confirm_timeout,
+            fib_min_score=args.fib_min_score,
+            fib_min_rr=args.fib_min_rr,
             reversal_ema_fast=args.reversal_ema_fast,
             reversal_ema_confirm=args.reversal_ema_confirm,
             reversal_ema_trend_fast=args.reversal_ema_trend_fast,
@@ -971,26 +1032,46 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    log_path = configure_runtime_logging()
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        install_asyncio_exception_logging(loop)
+    from utils.simulated_logging import LoggedConsole
+    def start():
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+        install_asyncio_exception_logging(_loop)
         print(f"[LOG] Writing runtime logs to {log_path}")
         print(f"[START] argv={argv if argv is not None else sys.argv[1:]}")
-        loop.run_until_complete(async_main(argv))
+        _loop.run_until_complete(async_main(argv))
+
+    args = argv if argv is not None else sys.argv[1:]
+    dry_run = "--dry-run" in args
+    log_path = configure_runtime_logging(SIMULATED_LOG_FILE if dry_run else None)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    restart = False
+    if dry_run:
+        sys.stdout = LoggedConsole(original_stdout)
+        # sys.stderr = LoggedConsole(original_stderr)
+    try:
+        start()
     except KeyboardInterrupt:
         print("\n[!] Interrupted.")
-    except Exception:
-        logging.getLogger("hypertrader").exception("[FATAL] Unhandled main() exception.")
-        sys.exit(1)
+    except Exception as err:
+        logging.getLogger("hypertrader").exception("[FATAL] Unhandled main() exception: %s" % err)
+        restart = True
+
+
     finally:
+        if dry_run:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout, sys.stderr = original_stdout, original_stderr
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
             loop = None
         if loop is not None and not loop.is_closed():
             loop.close()
+        if restart:
+            print('[!] Restarting ... ')
+            start()
 
 
 if __name__ == "__main__":

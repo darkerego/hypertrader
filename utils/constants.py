@@ -25,6 +25,7 @@ VALID_LIMIT_TIFS = {"Alo", "Gtc", "Ioc"}
 
 LOG_DIR = "logs"
 DEFAULT_LOG_FILE = os.path.join(LOG_DIR, "hypertrader.log")
+SIMULATED_LOG_FILE = os.path.join(LOG_DIR, "simulated.log")
 AUTO_TRADES_LOG_FILE = os.path.join(LOG_DIR, "auto_trades.log")
 WATCH_RETRY_SLEEP_SECONDS = 3.0
 

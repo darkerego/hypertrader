@@ -251,6 +251,7 @@ Key options:
 
 - `default`: the existing MACD/SAR/ADX/Bollinger auto trader and the implicit default when `--strategy` is omitted
 - `orderflow_pullback`: order-flow-confirmed trend pullback scalp strategy, also available as `of_pullback` and `orderflow`
+- `fib_reversal`: Fibonacci pullbacks in the original impulse direction; aliases `fib` and `fibonacci`
 - `reversal`: a closed-candle trend-exhaustion, structure-break, and retest strategy
 
 The strategy selection changes the signal engine only. Shared sizing, risk controls, modify-order entry, market-fallback cleanup, hidden-order behavior, and bracket management still run through the same common auto execution path.
@@ -270,8 +271,7 @@ python3 hypertrader.py auto [COIN] (--size SIZE | --size-pct SIZE_PCT) [options]
 
 Key options:
 
-- `--strategy {default,reversal}`
-- `--strategy {default,orderflow_pullback,reversal}` with aliases `of_pullback` and `orderflow`
+- `--strategy {default,fib_reversal,orderflow_pullback,reversal}` with aliases `fib`, `fibonacci`, `of_pullback`, and `orderflow`
 - `--size` or `--size-pct`
 - `--top-markets`
 - `--intervals`
@@ -310,7 +310,7 @@ Key options:
 - `--no-market-fallback`
 - `--market-slippage`
 - `--keep-existing-tpsl`
-- `--dry-run`
+- `--dry-run`: assume 10,000 cUSDC for account balance and percentage sizing; simulate positions without placing exchange orders. Percentage sizing uses public market prices and maximum leverage from market metadata, without querying account collateral or configured leverage.
 - `--max-trades`
 - `--cooldown-after-trade`
 - `--loop-after-trade`
@@ -331,6 +331,51 @@ Key options:
 - `--no-websocket`
 
 `auto` derives TP from Bollinger Bands unless `--take-profit-pct` overrides it. If TP is set and SL is omitted, SL defaults to half TP. Executions route through the same bracket-entry path used by `enter`.
+
+Fibonacci pullback strategy:
+
+```bash
+python3 hypertrader.py auto BTC --size-pct 10 --strategy fib_reversal
+```
+
+`fib_reversal` detects an ATR-qualified impulse on the trend timeframe,
+waits for a 38.2%/50%/61.8% Fibonacci retracement, then scores MACD
+reversal, DMI/ADX trend strength, optional ROC, price rejection, and
+higher-timeframe EMA alignment. It trades a pullback reversal in the original
+impulse direction. Anchors use confirmed symmetric pivots (default width 2),
+with at least 5 bars and a 2 ATR move inside the last 120 trend candles.
+
+```bash
+python3 hypertrader.py auto \
+    --size-pct 10 \
+    --top-markets 20 \
+    --strategy fib_reversal \
+    --trend-interval 1h \
+    --entry-interval 15m \
+    --fib-entry-levels "0.382,0.5,0.618" \
+    --fib-min-impulse-atr 2.0 \
+    --fib-min-score 5 \
+    --fib-min-rr 1.5
+```
+
+- Zone contact is required. Rejection, MACD histogram rotation/crossover, DMI,
+  rising ADX, ROC, and HTF EMA alignment contribute a weighted score (default
+  threshold 5/10). `--no-fib-roc` removes ROC and lowers the maximum to 9.
+- `--fib-zone-atr 0.15` sets zone tolerance. Confirmation expires after
+  `--fib-confirm-timeout 4` entry intervals and cannot trigger farther than
+  `--fib-max-entry-distance-atr 0.50` from the touched level.
+- Stops use the 0.786 retracement plus `--fib-stop-atr-buffer 0.25` ATR.
+  Closes beyond 0.786 plus `--fib-invalidation-atr 0.10` invalidate structure.
+  Explicitly including 0.786 moves invalidation to the impulse start; a 0.786
+  entry also places its stop beyond that start.
+- TP1 is the impulse extreme; TP2/TP3 are 1.272/1.618 extensions with
+  40%/35%/25% allocations. `--fib-min-rr 1.5` gates RR to **TP2**.
+- Each impulse can emit once per session. Entry references use completed candle
+  closes by default; actual fills remain owned by smart entry. Trend pivots
+  always require closed right-side candles. Timeouts use elapsed entry intervals.
+- Indicator defaults: ATR 14, MACD 12/26/9, ADX/DMI 14 with strength thresholds
+  18/25, ROC 9, trend EMAs 20/50. See `auto --help` for all `--fib-*` options.
+  TA-Lib period parameters requiring at least 2 are validated before launch.
 
 Reversal strategy notes:
 
@@ -490,7 +535,9 @@ The websocket cache is used as the fast path for market data such as mids, best 
 
 ## Logging
 
-Runtime logs are written to [`logs/hypertrader.log`](/media/anon/development/anon/PycharmProjects/hypertrader/logs/hypertrader.log).
+Dry-run console output, runtime messages, risk events, and simulated trades are written to `logs/simulated.log`. Simulation fills at observed market mid prices. Plans with explicit take-profit allocations, including `fib_reversal`, close the allocated portion of the original size at each reached target (40% at TP1, 35% at TP2, and 25% at TP3 for Fibonacci). Each fill logs a `simulated_take_profit_filled` event with its size and PnL. Position records track remaining size, cumulative realized PnL, and unrealized PnL on the remaining position; a stop closes only that remainder. Completed-trade PnL includes all partial exits. Plans without explicit allocations exit the full position at the stop or final target. Fees, funding, slippage, and dynamic stop adjustments are not modeled. Open positions at shutdown are logged with realized partial profits and their remaining unrealized PnL.
+
+Runtime logs for live runs are written to [`logs/hypertrader.log`](/media/anon/development/anon/PycharmProjects/hypertrader/logs/hypertrader.log).
 Completed auto-trades are appended to [`logs/auto_trades.log`](/media/anon/development/anon/PycharmProjects/hypertrader/logs/auto_trades.log).
 
 ## Validation

@@ -1,3 +1,13 @@
+# 2026-10-14
+
+- Fixed simulated Fibonacci trades ignoring TP1 and TP2: paper trading now follows the plan's 40%/35%/25% allocations, logs each partial fill, and applies stops only to the remaining size. Completion and shutdown records preserve realized partial profits separately from remaining unrealized PnL.
+
+# 2026-09-09
+
+- Added modular `fib_reversal` (`fib` / `fibonacci`) with ATR-qualified confirmed-pivot impulse anchors, Fibonacci retracement zones, weighted MACD reversal, DMI/ADX, optional ROC, price rejection and HTF EMA scoring, bounded confirmation, structural stops, and Fibonacci-extension TP targets.
+- Added Fibonacci CLI parameters and shared candle/backfill integration. The shared bracket ladder now optionally preserves explicit TP prices and allocations, including hidden orders and rebuilds; existing strategies retain their defaults.
+- Fixed asynchronous signal-price normalization used by explicit auto execution plans and added offline Fibonacci helper, lifecycle, registry and integration coverage.
+
 # 2026-07-10 22:59:15 EDT
 
 - Updated `README.md` so the new auto strategy functionality is documented more completely: the shared execution-path behavior for all strategies is now explicit, and the `reversal` strategy section now covers the main reversal-only CLI parameters and trade-planning behavior.
