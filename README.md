@@ -38,6 +38,7 @@ The canonical bot file in this repo is [`hypertrader.py`](/media/anon/developmen
 Install from pip: https://pypi.org/project/hypertrader
 
 <pre>
+pip install --upgrade pip setuptools wheel
 pip install hypertrader[auto] --upgrade
 </pre>
 
