@@ -15,6 +15,7 @@ from hyperliquid.utils import constants
 
 from utils.constants import INTERVAL_TO_MS, WATCH_RETRY_SLEEP_SECONDS
 from utils.worker import AsyncTaskQueue
+from utils.retry import retry_api_read
 
 decimal.getcontext().prec = 4
 
@@ -698,13 +699,24 @@ async def init_clients(use_testnet: bool, use_websocket: bool = True) -> Tuple[s
     api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
     account: LocalAccount = eth_account.Account.from_key(secret_key)
 
-    info = await Info.create(api_url, skip_ws=(not use_websocket))
-    exchange = await Exchange.create(account, api_url, account_address=account_address)
+    async def initialize() -> Tuple[str, Info, Exchange]:
+        # Keep references before initialization so failed SDK requests cannot
+        # strand HTTP sessions or websockets inside the SDK's create() methods.
+        info = Info(api_url, skip_ws=(not use_websocket))
+        exchange = None
+        try:
+            await info.initialize()
+            exchange = Exchange(account, api_url, account_address=account_address)
+            await exchange.initialize()
+            ws_cache = HyperliquidWebsocketCache(info, account_address, enabled=use_websocket)
+            setattr(info, "ws_cache", ws_cache)
+            await ws_cache.start()
+            return account_address, info, exchange
+        except BaseException:
+            await close_clients(info, exchange)
+            raise
 
-    ws_cache = HyperliquidWebsocketCache(info, account_address, enabled=use_websocket)
-    setattr(info, "ws_cache", ws_cache)
-    await ws_cache.start()
-    return account_address, info, exchange
+    return await retry_api_read(initialize, context="Hyperliquid client initialization")
 
 
 async def close_clients(info: Optional[Info], exchange: Optional[Exchange]) -> None:

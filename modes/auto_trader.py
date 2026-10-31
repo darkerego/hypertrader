@@ -18,6 +18,7 @@ from strategies.base import AutoStrategy, StrategyContext, StrategySignal
 from strategies.registry import create_strategy
 from strategies.reversal import normalize_signal_prices
 from utils.constants import AUTO_TRADES_LOG_FILE, SIMULATED_LOG_FILE, INTERVAL_TO_MS, PRICE_EPS, cp
+from utils.retry import retry_api_read
 from utils.helpers import parse_interval_list, init_clients, _try_float, parse_fractional_pct, \
     extract_account_balance_from_user_state, round_size_for_hyperliquid, get_user_state_with_retry, get_all_mids, \
     fetch_recent_candles, compute_position_unrealized_pnl, close_clients, compute_default_stop_loss_pct, \
@@ -105,7 +106,9 @@ async def get_top_perp_markets_by_volume(info: Info, limit: int) -> List[Tuple[s
     if limit <= 0:
         raise RuntimeError("--top-markets must be > 0.")
 
-    meta_and_ctxs = await info.meta_and_asset_ctxs()
+    meta_and_ctxs = await retry_api_read(
+        info.meta_and_asset_ctxs, context="auto market ranking"
+    )
     if not isinstance(meta_and_ctxs, (list, tuple)) or len(meta_and_ctxs) < 2:
         raise RuntimeError(f"Unexpected metaAndAssetCtxs response shape: {type(meta_and_ctxs).__name__}")
 
@@ -2883,11 +2886,14 @@ async def run_auto_trader(
             startup_backfill_state.begin_iteration()
 
             try:
-                shared_snapshot = await build_auto_scan_loop_snapshot(
-                    info=info,
-                    account_address=account_address,
-                    metrics_start_time_ms=metrics_start_time_ms,
-                    dry_run=dry_run,
+                shared_snapshot = await retry_api_read(
+                    lambda: build_auto_scan_loop_snapshot(
+                        info=info,
+                        account_address=account_address,
+                        metrics_start_time_ms=metrics_start_time_ms,
+                        dry_run=dry_run,
+                    ),
+                    context="auto shared snapshot",
                 )
             except Exception as exc:
                 if is_rate_limit_error(exc):

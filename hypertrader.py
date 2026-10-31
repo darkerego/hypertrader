@@ -1033,45 +1033,40 @@ async def async_main(argv: Optional[List[str]] = None) -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     from utils.simulated_logging import LoggedConsole
-    def start():
-        _loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_loop)
-        install_asyncio_exception_logging(_loop)
+
+    async def start() -> None:
+        install_asyncio_exception_logging(asyncio.get_running_loop())
         print(f"[LOG] Writing runtime logs to {log_path}")
         print(f"[START] argv={argv if argv is not None else sys.argv[1:]}")
-        _loop.run_until_complete(async_main(argv))
+        await async_main(argv)
 
     args = argv if argv is not None else sys.argv[1:]
     dry_run = "--dry-run" in args
     log_path = configure_runtime_logging(SIMULATED_LOG_FILE if dry_run else None)
     original_stdout, original_stderr = sys.stdout, sys.stderr
-    restart = False
     if dry_run:
         sys.stdout = LoggedConsole(original_stdout)
         # sys.stderr = LoggedConsole(original_stderr)
     try:
-        start()
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted.")
-    except Exception as err:
-        logging.getLogger("hypertrader").exception("[FATAL] Unhandled main() exception: %s" % err)
-        restart = True
-
-
+        # Give both the initial run and the single retry a complete lifecycle:
+        # cancellation, awaited cleanup, then event-loop shutdown.
+        for attempt in range(2):
+            try:
+                asyncio.run(start())
+                break
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted.")
+                break
+            except Exception as err:
+                logging.getLogger("hypertrader").exception("[FATAL] Unhandled main() exception: %s", err)
+                if attempt == 1:
+                    raise
+                print('[!] Restarting ... ')
     finally:
         if dry_run:
             sys.stdout.flush()
             sys.stderr.flush()
             sys.stdout, sys.stderr = original_stdout, original_stderr
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and not loop.is_closed():
-            loop.close()
-        if restart:
-            print('[!] Restarting ... ')
-            start()
 
 
 if __name__ == "__main__":
